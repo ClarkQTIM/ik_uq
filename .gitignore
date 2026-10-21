@@ -1,0 +1,20 @@
+# Outputs and model weights: never commit
+runs/
+runs_*/
+logs/
+*.pt
+*.pth
+*.npz
+*.npy
+# Data: never commit (contains participant identifiers)
+*.csv
+!requirements*.txt
+data/
+# Office / reports
+*.docx
+*.xlsx
+*.pptx
+# Python
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
