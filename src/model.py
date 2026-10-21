@@ -1,708 +1,749 @@
 """
-Latent Supervision — Infectious Keratitis Classifier
-=====================================================
-Faithful reproduction of Yazbeck et al. (2026) with two novel extensions.
+Latent Supervision - Infectious Keratitis Classifier (v2)
+=========================================================
+Trains one cell of the 2x2 study: head (sigmoid | beta_dirichlet) x labels (soft | hard).
 
-Three head types:
-    sigmoid        — faithful R script reproduction (rescaled MSE loss)
-    dirichlet      — joint 2-class Dirichlet head (ICMLA paper, eqs 3-7)
-                     outputs α = [α_bac, α_fung]; classes compete via simplex
-    beta_dirichlet — TWO INDEPENDENT K=2 Dirichlet (Beta) heads, one per pathogen
-                     outputs [α_bac, β_bac, α_fung, β_fung]
-                     p̂_bac  = α_bac  / (α_bac  + β_bac)
-                     p̂_fung = α_fung / (α_fung + β_fung)
-                     Evidence per pathogen is INDEPENDENT — fixes the zero-sum
-                     competition problem of the joint Dirichlet head, which is
-                     mathematically wrong for a multilabel task.
+v2 changes (2026-10-21; see the audit log, findings C1-C4, M1-M2, M9, R1-R5):
+  * Labels come from labels.py: soft target = posterior where one exists, otherwise
+    the LCA bin; reference = LCA bin; scored as binary bacterial vs fungal.
+  * --recipe paper (default) follows Yazbeck et al., supplement section 3, latent
+    supervision keratitis model, and the R demo where the paper is silent:
+        EfficientNetB7 (ImageNet weights), 600x600 input.
+        Trainable from Keras layer 753 = start of the last stage (timm backbone.blocks[6])
+        plus the top conv and the head; every backbone BatchNorm frozen (inference mode).
+        Adam, learning rate 1e-5, gradient clipnorm 1 (per weight, as Keras does),
+        dropout 0.3, batch 32, 15 epochs, one phase, no early stopping.
+        The final-epoch model is the model (the demo saves no checkpoints).
+        Augmentation (demo): rotation +-54 deg, translation +-10%, horizontal and vertical
+        flips, contrast +-10%, reflect fill.
+      Keras defaults matched where cheap (--keras_parity 1, default for paper):
+        stochastic depth 0.2 in the backbone (Keras drop_connect_rate), head BatchNorm
+        eps 1e-3 / momentum 0.99, Adam epsilon 1e-7, Glorot-uniform head initialisation.
+  * --recipe legacy keeps the previous two-phase schedule, for comparison only.
+  * Fails loudly: missing images stop the run at start-up, unreadable images raise,
+    a non-finite loss raises.
+  * Split grouped by pID (was subject).
+  * Outputs go under --out_root and never into a folder called runs/.
+  * Writes test_predictions.npz (no identifiers) for the analysis.
 
-Also adds:
-    --patience     early stopping patience (default 5, 0 = disabled)
-    --batch_phase2 separate batch size for Phase 2 (default = same as --batch)
-    --lr_phase2    separate learning rate for Phase 2 (default = same as --lr)
-
-Install:
-    pip install torch torchvision timm pillow numpy pandas scikit-learn tqdm
-
-Run:
-    python model.py --head beta_dirichlet --epochs 30 --patience 5
+Typical use (paper recipe, Cell A):
+    python src/model.py --head sigmoid --label_type soft \
+        --out_root /scratch90/chris_/ik_uq_runs --device cuda:0
+Check labels and images only:
+    python src/model.py --dry_run
 """
 
-import os
 import argparse
 import json
+import os
+import random
+import subprocess
+import sys
+from datetime import datetime
+
 import numpy as np
 import pandas as pd
-import torch
-import torch.nn as nn
-from torch.utils.data import Dataset, DataLoader
-from torchvision import transforms
-from PIL import Image
-from sklearn.model_selection import GroupShuffleSplit
-from datetime import datetime
 import timm
+import torch
+from timm.data import resolve_data_config
+import torch.nn as nn
+import torchvision.transforms.functional as TF
+from PIL import Image
+from sklearn.metrics import roc_auc_score
+from torch.utils.data import DataLoader, Dataset
+from torchvision import transforms
+from torchvision.transforms import InterpolationMode
 from tqdm import tqdm
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from labels import (STUDY_SHORT, label_summary, load_labelled,  # noqa: E402
+                    participant_codes, split_by_participant, targets)
+
+DEFAULT_CSV = ("/persist/QTIM/Active/26-0096/Corneal_Ulcer_Image_Sets/Data/"
+               "corneal_ulcer_study_data_7_24_2025_lambda.csv")
+DEFAULT_IMG_ROOT = "/pacs/OSHU/Corneal_Ulcer_Image_Sets"
+
+RECIPES = {
+    #            epochs  batch  patience  keras_parity
+    "paper":  dict(epochs=15, batch=32, patience=0, keras_parity=1),
+    "legacy": dict(epochs=30, batch=8,  patience=5, keras_parity=0),
+}
+
 
 # =============================================================================
-# ARGUMENT PARSING
+# ARGUMENTS
 # =============================================================================
 
-def get_args():
-    parser = argparse.ArgumentParser(description="Latent Supervision Keratitis Classifier")
-    parser.add_argument("--csv",         type=str,
-                        default="/persist/QTIM/Active/26-0096/Corneal_Ulcer_Image_Sets/Data/corneal_ulcer_study_data_7_24_2025_lambda.csv")
-    parser.add_argument("--img_root",    type=str,
-                        default="/pacs/OSHU/Corneal_Ulcer_Image_Sets")
-    parser.add_argument("--head",        type=str, default="sigmoid",
-                        choices=["sigmoid", "dirichlet", "beta_dirichlet"])
-    parser.add_argument("--epochs",      type=int,   default=30)
-    parser.add_argument("--batch",       type=int,   default=8)
-    parser.add_argument("--batch_phase2",type=int,   default=None,
-                        help="Batch size for Phase 2. Defaults to --batch.")
-    parser.add_argument("--lr",          type=float, default=1e-5)
-    parser.add_argument("--lr_phase2",   type=float, default=None,
-                        help="Learning rate for Phase 2. Defaults to --lr.")
-    parser.add_argument("--dropout",     type=float, default=0.3)
-    parser.add_argument("--patience",    type=int,   default=5,
-                        help="Early stopping patience (epochs without val loss improvement). "
-                             "0 = disabled.")
-    parser.add_argument("--seed",        type=int,   default=42)
-    parser.add_argument("--label_type", type=str,   default="soft",
-                        choices=["soft", "hard"],
-                        help="soft = LCA posteriors (bac_post_prob, fung_post_prob); "
-                             "hard = binarized LCA bins (bac_LCA_bin, fung_LCA_bin)")
-    parser.add_argument("--out_dir",     type=str,   default=None)
-    parser.add_argument("--device",      type=str,   default=None,
-                        help="Device to use, e.g. 'cuda:0', 'cuda:1', 'cpu'. "
-                             "Defaults to cuda if available, else cpu.")
-    return parser.parse_args()
+def get_args(argv=None):
+    p = argparse.ArgumentParser(description="Latent Supervision Keratitis Classifier (v2)")
+    p.add_argument("--csv", default=DEFAULT_CSV)
+    p.add_argument("--img_root", default=DEFAULT_IMG_ROOT)
+    p.add_argument("--head", default="sigmoid", choices=["sigmoid", "dirichlet", "beta_dirichlet"])
+    p.add_argument("--label_type", default="soft", choices=["soft", "hard"])
+    p.add_argument("--recipe", default="paper", choices=list(RECIPES))
+    p.add_argument("--epochs", type=int, default=None, help="paper 15; legacy 30 per phase")
+    p.add_argument("--batch", type=int, default=None, help="paper 32; legacy 8")
+    p.add_argument("--accum", type=int, default=1,
+                   help="gradient accumulation steps (effective batch = batch x accum); "
+                        "use e.g. --batch 16 --accum 2 if batch 32 does not fit")
+    p.add_argument("--batch_phase2", type=int, default=None, help="legacy only")
+    p.add_argument("--lr", type=float, default=1e-5)
+    p.add_argument("--lr_phase2", type=float, default=None, help="legacy only")
+    p.add_argument("--dropout", type=float, default=0.3)
+    p.add_argument("--patience", type=int, default=None, help="early stopping; paper 0 (off)")
+    p.add_argument("--keras_parity", type=int, default=None, choices=[0, 1])
+    p.add_argument("--seed", type=int, default=42)
+    p.add_argument("--group_col", default="pID", help="column the split is grouped by")
+    p.add_argument("--exclude_followups_train", action="store_true",
+                   help="drop follow-up photos (3 weeks, 3 months, 12 months) from training")
+    p.add_argument("--backbone", default="tf_efficientnet_b7.ra_in1k")
+    p.add_argument("--no_pretrained", action="store_true", help="testing only")
+    p.add_argument("--img_size", type=int, default=600)
+    p.add_argument("--num_workers", type=int, default=4)
+    p.add_argument("--out_root", default=None, help="parent folder for run folders (not runs/)")
+    p.add_argument("--out_dir", default=None, help="exact run folder (overrides --out_root)")
+    p.add_argument("--run_name", default=None)
+    p.add_argument("--device", default=None, help="e.g. cuda:0")
+    p.add_argument("--dry_run", action="store_true", help="check labels and images, then exit")
+    p.add_argument("--smoke", action="store_true", help="tiny end-to-end run to test the pipeline")
+    args = p.parse_args(argv)
+    for k, v in RECIPES[args.recipe].items():
+        if getattr(args, k) is None:
+            setattr(args, k, v)
+    if args.smoke:
+        args.epochs = 1
+    return args
+
+
+def git_info():
+    here = os.path.dirname(os.path.abspath(__file__))
+    try:
+        commit = subprocess.run(["git", "rev-parse", "HEAD"], cwd=here, capture_output=True,
+                                text=True, timeout=10).stdout.strip()
+        dirty = bool(subprocess.run(["git", "status", "--porcelain"], cwd=here,
+                                    capture_output=True, text=True, timeout=10).stdout.strip())
+        return {"commit": commit or None, "uncommitted_changes": dirty}
+    except Exception:
+        return {"commit": None, "uncommitted_changes": None}
 
 
 def make_output_dir(args):
-    if args.out_dir is not None:
+    if args.out_dir:
         out_dir = args.out_dir
     else:
-        timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-        out_dir = os.path.join("runs", f"{args.head}_{args.label_type}_{timestamp}")
+        if not args.out_root:
+            raise SystemExit("Give --out_root (a folder outside runs/) or --out_dir.")
+        ts = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        name = args.run_name or f"{args.head}_{args.label_type}_{args.recipe}_{ts}"
+        if args.smoke:
+            name = "SMOKE_" + name
+        out_dir = os.path.join(args.out_root, name)
+    if "runs" in os.path.normpath(os.path.abspath(out_dir)).split(os.sep):
+        raise SystemExit(f"Refusing to write inside a folder called 'runs' ({out_dir}): "
+                         f"that is where the old results live. Use a different --out_root.")
+    if os.path.exists(out_dir) and os.listdir(out_dir):
+        raise SystemExit(f"{out_dir} already exists and is not empty.")
     os.makedirs(out_dir, exist_ok=True)
-    with open(os.path.join(out_dir, "config.json"), "w") as f:
-        json.dump(vars(args), f, indent=2)
     print(f"Output directory: {out_dir}\n")
     return out_dir
+
+
+def seed_everything(seed):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+
+def worker_init(worker_id):
+    s = torch.initial_seed() % 2**32
+    np.random.seed(s)
+    random.seed(s)
 
 
 # =============================================================================
 # DATA
 # =============================================================================
 
-PACS_PREFIX = "/pacs/OSHU/Corneal_Ulcer_Image_Sets"
-
-def remap_path(file_path, img_root):
-    return file_path.replace(PACS_PREFIX, img_root)
-
-
-def load_dataframe(csv_path, img_root):
-    df = pd.read_csv(csv_path)
-    df = df.dropna(subset=["file_path", "subject"])
-    unlabelable = (df["fung_LCA_bin"] == -1) & (df["bac_LCA_bin"] == -1)
-    df = df[~unlabelable].reset_index(drop=True)
-    df["local_path"] = df["file_path"].apply(lambda p: remap_path(p, img_root))
-    print(f"Loaded {len(df):,} rows after filtering")
-    print(f"  Unique subjects: {df['subject'].nunique():,}")
-    print(f"  Studies: {df['study'].value_counts().to_dict()}\n")
-    return df
-
-
-def split_dataframe(df, seed=42):
-    subjects = df["subject"].values
-    gss = GroupShuffleSplit(n_splits=1, test_size=0.30, random_state=seed)
-    train_idx, temp_idx = next(gss.split(df, groups=subjects))
-    df_train = df.iloc[train_idx].reset_index(drop=True)
-    df_temp  = df.iloc[temp_idx].reset_index(drop=True)
-
-    gss2 = GroupShuffleSplit(n_splits=1, test_size=0.50, random_state=seed)
-    val_idx, test_idx = next(gss2.split(df_temp, groups=df_temp["subject"].values))
-    df_val  = df_temp.iloc[val_idx].reset_index(drop=True)
-    df_test = df_temp.iloc[test_idx].reset_index(drop=True)
-
-    print(f"Split sizes:")
-    print(f"  Train: {len(df_train):,} ({df_train['subject'].nunique():,} subjects)")
-    print(f"  Val:   {len(df_val):,} ({df_val['subject'].nunique():,} subjects)")
-    print(f"  Test:  {len(df_test):,} ({df_test['subject'].nunique():,} subjects)\n")
-    return df_train, df_val, df_test
-
-
 class KeratitisDataset(Dataset):
-    def __init__(self, df, transform=None, label_type="soft"):
-        self.df = df
+    def __init__(self, paths, y, transform):
+        self.paths = list(paths)
+        self.y = torch.as_tensor(np.asarray(y, dtype=np.float32))
         self.transform = transform
-        self.label_type = label_type
 
     def __len__(self):
-        return len(self.df)
+        return len(self.paths)
 
-    def __getitem__(self, idx):
-        row = self.df.iloc[idx]
+    def __getitem__(self, i):
         try:
-            image = Image.open(row["local_path"]).convert("RGB")
-        except Exception as e:
-            print(f"Warning: could not load {row['local_path']}: {e}")
-            image = Image.new("RGB", (600, 600), color=0)
-        if self.transform:
-            image = self.transform(image)
-        if self.label_type == "soft":
-            label = torch.tensor(
-                [row["bac_post_prob"], row["fung_post_prob"]],
-                dtype=torch.float32
-            )
-        else:  # hard — binarized LCA bins (0 or 1, no -1 after standard filtering)
-            label = torch.tensor(
-                [float(row["bac_LCA_bin"]), float(row["fung_LCA_bin"])],
-                dtype=torch.float32
-            )
-        return image, label
+            img = Image.open(self.paths[i]).convert("RGB")
+        except Exception as e:  # fail loudly (audit M9): never substitute a blank image
+            raise RuntimeError(f"Could not read image {self.paths[i]}: {e}") from e
+        return self.transform(img), self.y[i]
 
 
-train_transforms = transforms.Compose([
-    transforms.RandomRotation(degrees=15),
-    transforms.RandomAffine(degrees=0, translate=(0.1, 0.1)),
-    transforms.RandomHorizontalFlip(),
-    transforms.RandomVerticalFlip(),
-    transforms.ColorJitter(contrast=0.1),
-    transforms.Resize((600, 600)),
-    transforms.ToTensor(),
-    transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
-])
+class KerasStyleAugment:
+    """
+    The R demo's augmentation, applied to the 600x600 input as Keras does:
+      layer_random_rotation(0.15)            -> angle uniform in +-0.15 * 360 deg = +-54 deg
+      layer_random_translation(0.1, 0.1)     -> shift uniform in +-10% of height / width
+      layer_random_flip()                    -> horizontal and vertical, each with p = 0.5
+      layer_random_contrast(0.1)             -> (x - channel mean) * U(0.9, 1.1) + mean, clipped
+    Keras fills with reflection (fill_mode="reflect"); here: reflect-pad, transform, crop.
+    """
 
-val_transforms = transforms.Compose([
-    transforms.Resize((600, 600)),
-    transforms.ToTensor(),
-    transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
-])
+    def __init__(self, size, mean, std, rotation=0.15, translation=0.1, contrast=0.1):
+        self.size, self.mean, self.std = size, list(mean), list(std)
+        self.rotation, self.translation, self.contrast = rotation, translation, contrast
+
+    def __call__(self, img):
+        s = self.size
+        img = TF.resize(img, [s, s], interpolation=InterpolationMode.BILINEAR)
+        pad = s // 2
+        img = TF.pad(img, [pad, pad, pad, pad], padding_mode="reflect")
+        angle = random.uniform(-self.rotation * 360.0, self.rotation * 360.0)
+        tx = int(round(random.uniform(-self.translation, self.translation) * s))
+        ty = int(round(random.uniform(-self.translation, self.translation) * s))
+        img = TF.affine(img, angle=angle, translate=[tx, ty], scale=1.0, shear=[0.0, 0.0],
+                        interpolation=InterpolationMode.BILINEAR)
+        img = TF.center_crop(img, [s, s])
+        if random.random() < 0.5:
+            img = TF.hflip(img)
+        if random.random() < 0.5:
+            img = TF.vflip(img)
+        x = TF.to_tensor(img)
+        f = random.uniform(1.0 - self.contrast, 1.0 + self.contrast)
+        m = x.mean(dim=(1, 2), keepdim=True)
+        x = ((x - m) * f + m).clamp(0.0, 1.0)
+        return TF.normalize(x, self.mean, self.std)
+
+
+def eval_transform(size, mean, std):
+    return transforms.Compose([
+        transforms.Resize((size, size)),
+        transforms.ToTensor(),
+        transforms.Normalize(list(mean), list(std)),
+    ])
+
+
+def legacy_train_transform(size):
+    return transforms.Compose([
+        transforms.RandomRotation(degrees=15),
+        transforms.RandomAffine(degrees=0, translate=(0.1, 0.1)),
+        transforms.RandomHorizontalFlip(),
+        transforms.RandomVerticalFlip(),
+        transforms.ColorJitter(contrast=0.1),
+        transforms.Resize((size, size)),
+        transforms.ToTensor(),
+        transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
+    ])
 
 
 # =============================================================================
 # HEADS
 # =============================================================================
 
+def _head_bn(n, keras):
+    # Keras BatchNormalization: epsilon 1e-3, momentum 0.99 (= PyTorch momentum 0.01)
+    return nn.BatchNorm1d(n, eps=1e-3, momentum=0.01) if keras else nn.BatchNorm1d(n)
+
+
+def _glorot(module):
+    for m in module.modules():
+        if isinstance(m, nn.Linear):
+            nn.init.xavier_uniform_(m.weight)
+            nn.init.zeros_(m.bias)
+
+
 class SigmoidHead(nn.Module):
-    """R script reproduction — sigmoid output, rescaled MSE loss."""
-    def __init__(self, in_features, dropout=0.3):
+    """The demo's head: GAP -> BN -> 512 ReLU -> dropout -> 32 ReLU -> dropout -> 2 sigmoid."""
+
+    def __init__(self, in_features, dropout=0.3, keras=False):
         super().__init__()
         self.net = nn.Sequential(
-            nn.BatchNorm1d(in_features),
+            _head_bn(in_features, keras),
             nn.Linear(in_features, 512), nn.ReLU(), nn.Dropout(p=dropout),
-            nn.Linear(512, 32),          nn.ReLU(), nn.Dropout(p=dropout),
+            nn.Linear(512, 32), nn.ReLU(), nn.Dropout(p=dropout),
             nn.Linear(32, 2),
-            nn.Sigmoid()
+            nn.Sigmoid(),
         )
+        if keras:
+            _glorot(self)
 
     def forward(self, x):
-        return self.net(x)   # shape: (batch, 2)  values in (0, 1)
+        return self.net(x)
 
 
 class DirichletHead(nn.Module):
-    """
-    Joint 2-class Dirichlet head (ICMLA paper).
-    Outputs α = [α_bac, α_fung] > 0.
-    p̂ = α / sum(α)  — classes compete on the simplex.
-    Limitation: wrong geometry for multilabel (bac and fung are not mutually exclusive).
-    """
-    def __init__(self, in_features, dropout=0.3):
+    """Joint 2-class Dirichlet head (ICMLA). Outputs alpha = [alpha_bac, alpha_fung] > 0."""
+
+    def __init__(self, in_features, dropout=0.3, keras=False):
         super().__init__()
         self.net = nn.Sequential(
-            nn.BatchNorm1d(in_features),
+            _head_bn(in_features, keras),
             nn.Linear(in_features, 512), nn.ReLU(), nn.Dropout(p=dropout),
-            nn.Linear(512, 32),          nn.ReLU(), nn.Dropout(p=dropout),
+            nn.Linear(512, 32), nn.ReLU(), nn.Dropout(p=dropout),
             nn.Linear(32, 2),
-            nn.Softplus()
+            nn.Softplus(),
         )
+        if keras:
+            _glorot(self)
 
     def forward(self, x):
-        return self.net(x)   # shape: (batch, 2)  values > 0  (α_bac, α_fung)
+        return self.net(x)
 
 
 class BetaDirichletHead(nn.Module):
     """
-    Two independent K=2 Dirichlet (Beta) heads — one per pathogen.
-    Outputs [α_bac, β_bac, α_fung, β_fung] > 0.
-
-    Per pathogen:
-        p̂_bac  = α_bac  / (α_bac  + β_bac)
-        p̂_fung = α_fung / (α_fung + β_fung)
-
-    Evidence per pathogen:
-        E_bac  = α_bac  + β_bac    (independent of fungal evidence)
-        E_fung = α_fung + β_fung   (independent of bacterial evidence)
-
-    Key difference from DirichletHead:
-        - α_bac and α_fung are NOT competing. High evidence for one does not
-          suppress evidence for the other. This is mathematically correct for
-          a multilabel task where polymicrobial infection is possible.
-        - Each pathogen has its own uncertainty estimate (β encodes absence
-          evidence; high β_bac = strong evidence patient is NOT bacterial).
-
-    Shared trunk (512 → 32) to keep parameter count comparable to other heads,
-    then two independent output layers (one per pathogen, each → 2 params).
+    Two K=2 Dirichlet (Beta) outputs, one per pathogen, on a shared trunk.
+    Outputs [alpha_bac, beta_bac, alpha_fung, beta_fung] > 0.
+    With binary labels the two Betas describe the same event, so expect them to mirror
+    each other; mean evidence is (alpha_bac + beta_bac + alpha_fung + beta_fung) / 2.
     """
-    def __init__(self, in_features, dropout=0.3):
+
+    def __init__(self, in_features, dropout=0.3, keras=False):
         super().__init__()
-        # Shared feature extraction
         self.trunk = nn.Sequential(
-            nn.BatchNorm1d(in_features),
+            _head_bn(in_features, keras),
             nn.Linear(in_features, 512), nn.ReLU(), nn.Dropout(p=dropout),
-            nn.Linear(512, 32),          nn.ReLU(), nn.Dropout(p=dropout),
+            nn.Linear(512, 32), nn.ReLU(), nn.Dropout(p=dropout),
         )
-        # Independent per-pathogen output heads
-        self.bac_head  = nn.Sequential(nn.Linear(32, 2), nn.Softplus())
+        self.bac_head = nn.Sequential(nn.Linear(32, 2), nn.Softplus())
         self.fung_head = nn.Sequential(nn.Linear(32, 2), nn.Softplus())
+        if keras:
+            _glorot(self)
 
     def forward(self, x):
-        features = self.trunk(x)
-        bac_params  = self.bac_head(features)   # [α_bac,  β_bac]
-        fung_params = self.fung_head(features)  # [α_fung, β_fung]
-        return torch.cat([bac_params, fung_params], dim=-1)  # shape: (batch, 4)
+        f = self.trunk(x)
+        return torch.cat([self.bac_head(f), self.fung_head(f)], dim=-1)
 
 
 # =============================================================================
 # MODEL
 # =============================================================================
 
+BN_TYPES = nn.modules.batchnorm._BatchNorm
+
+
 class EfficientNetB7(nn.Module):
-    def __init__(self, head_type="sigmoid", dropout=0.3,
-                 freeze_backbone=True, pretrained=True):
+    def __init__(self, head_type="sigmoid", dropout=0.3, pretrained=True,
+                 backbone_name="tf_efficientnet_b7.ra_in1k", drop_path_rate=0.0, keras=False):
         super().__init__()
         assert head_type in ("sigmoid", "dirichlet", "beta_dirichlet")
         self.head_type = head_type
-
-        self.backbone = timm.create_model(
-            "tf_efficientnet_b7.ra_in1k",
-            pretrained=pretrained,
-            num_classes=0,
-            global_pool="avg"
-        )
-        backbone_features = self.backbone.num_features  # 2560 for B7
-
-        if freeze_backbone:
-            for param in self.backbone.parameters():
-                param.requires_grad = False
-
-        if head_type == "sigmoid":
-            self.head = SigmoidHead(backbone_features, dropout)
-        elif head_type == "dirichlet":
-            self.head = DirichletHead(backbone_features, dropout)
-        else:
-            self.head = BetaDirichletHead(backbone_features, dropout)
+        self.freeze_backbone_bn = False
+        self.backbone = timm.create_model(backbone_name, pretrained=pretrained, num_classes=0,
+                                          global_pool="avg", drop_path_rate=drop_path_rate)
+        for prm in self.backbone.parameters():
+            prm.requires_grad = False
+        nf = self.backbone.num_features
+        head_cls = {"sigmoid": SigmoidHead, "dirichlet": DirichletHead,
+                    "beta_dirichlet": BetaDirichletHead}[head_type]
+        self.head = head_cls(nf, dropout, keras)
 
     def forward(self, x):
         return self.head(self.backbone(x))
 
-    def predict(self, x):
-        """
-        Returns class probabilities and per-pathogen evidence for all head types.
+    def train(self, mode=True):
+        super().train(mode)
+        if self.freeze_backbone_bn:  # Keras: frozen BatchNorm runs in inference mode
+            for m in self.backbone.modules():
+                if isinstance(m, BN_TYPES):
+                    m.eval()
+        return self
 
-        sigmoid:        p_hat = sigmoid outputs directly
-        dirichlet:      p_hat = α / α₀,  total_evidence = α₀ (scalar, both classes)
-        beta_dirichlet: p_hat = [α_bac/(α+β), α_fung/(α+β)]
-                        evidence_bac  = α_bac + β_bac   (per-pathogen)
-                        evidence_fung = α_fung + β_fung  (per-pathogen)
+    def set_trainable_last_stage(self):
         """
-        out = self.forward(x)
-
-        if self.head_type == "sigmoid":
-            return {
-                "p_hat":          out,
-                "total_evidence": None,
-                "evidence_bac":   None,
-                "evidence_fung":  None,
-            }
-        elif self.head_type == "dirichlet":
-            alpha_0 = out.sum(dim=-1, keepdim=True)
-            return {
-                "p_hat":          out / alpha_0,
-                "total_evidence": alpha_0.squeeze(-1),
-                "evidence_bac":   None,
-                "evidence_fung":  None,
-            }
-        else:  # beta_dirichlet
-            alpha_bac  = out[:, 0]
-            beta_bac   = out[:, 1]
-            alpha_fung = out[:, 2]
-            beta_fung  = out[:, 3]
-            e_bac  = alpha_bac  + beta_bac
-            e_fung = alpha_fung + beta_fung
-            p_bac  = alpha_bac  / e_bac
-            p_fung = alpha_fung / e_fung
-            return {
-                "p_hat":          torch.stack([p_bac, p_fung], dim=-1),
-                "total_evidence": (e_bac + e_fung) / 2,  # mean for display
-                "evidence_bac":   e_bac,
-                "evidence_fung":  e_fung,
-            }
+        Paper recipe: train from Keras layer 753 (start of block 7, the last stage) onward,
+        i.e. timm backbone.blocks[-1] and conv_head, plus the head. Every backbone
+        BatchNorm stays frozen and in inference mode, as in the demo's unfreeze loop.
+        Parameters are set per module (recurse=False) so containers cannot re-enable BN.
+        """
+        self.freeze_backbone_bn = True
+        for prm in self.backbone.parameters():
+            prm.requires_grad = False
+        last = len(self.backbone.blocks) - 1
+        prefixes = (f"blocks.{last}.", "conv_head")
+        for name, m in self.backbone.named_modules():
+            if not name.startswith(prefixes) or isinstance(m, BN_TYPES):
+                continue
+            for prm in m.parameters(recurse=False):
+                prm.requires_grad = True
+        for prm in self.head.parameters():
+            prm.requires_grad = True
+        self.train(self.training)
+        return last
 
     def unfreeze(self, from_block=54):
-        """
-        Progressive unfreezing — mirrors unfreeze_weak_model() in R script.
-        ENB7_blocks[2] = 54 (the R script default).
-        BatchNorm layers stay frozen throughout.
-        """
+        """Legacy recipe only: the old Phase 2 unfreeze, unchanged (see audit M1)."""
         for i, (name, module) in enumerate(self.backbone.named_modules()):
-            if i >= from_block:
-                if not isinstance(module, (nn.BatchNorm2d, nn.BatchNorm1d)):
-                    for param in module.parameters():
-                        param.requires_grad = True
-        trainable = sum(p.numel() for p in self.parameters() if p.requires_grad)
-        print(f"  Unfrozen from block {from_block}. Trainable params: {trainable:,}")
+            if i >= from_block and not isinstance(module, (nn.BatchNorm2d, nn.BatchNorm1d)):
+                for prm in module.parameters():
+                    prm.requires_grad = True
+
+    def p_hat(self, out):
+        """Per-pathogen probabilities [p_bac, p_fung] from raw outputs."""
+        if self.head_type == "sigmoid":
+            return out
+        if self.head_type == "dirichlet":
+            return out / out.sum(dim=-1, keepdim=True)
+        return torch.stack([out[:, 0] / (out[:, 0] + out[:, 1]),
+                            out[:, 2] / (out[:, 2] + out[:, 3])], dim=-1)
+
+
+def count_trainable(model):
+    return sum(prm.numel() for prm in model.parameters() if prm.requires_grad)
 
 
 # =============================================================================
-# LOSS FUNCTIONS
+# LOSSES (unchanged)
 # =============================================================================
 
 def rescaled_mse_loss(y_true, y_pred):
-    """R script loss — MSE * 10."""
+    """The paper's loss: MSE x 10."""
     return ((y_true - y_pred) ** 2 * 10).mean()
 
 
 def dirichlet_loss(y_true, alpha, lambda_kl):
-    """
-    ICMLA paper equation 5 — joint Dirichlet MSE + annealed KL.
-    y_true: soft labels [bac_prob, fung_prob], shape (batch, 2)
-    alpha:  concentration params [α_bac, α_fung], shape (batch, 2)
-    """
+    """Dirichlet MSE + variance term (ICMLA eq. 5) + KL on alpha_tilde (Sensoy et al.)."""
     alpha_0 = alpha.sum(dim=-1, keepdim=True)
-    p_hat   = alpha / alpha_0
-
-    mse_term = (
-        (y_true - p_hat) ** 2 +
-        p_hat * (1 - p_hat) / (alpha_0 + 1)
-    ).sum(dim=-1)
-
-    alpha_tilde   = y_true + (1.0 - y_true) * alpha
+    p_hat = alpha / alpha_0
+    mse_term = ((y_true - p_hat) ** 2 + p_hat * (1 - p_hat) / (alpha_0 + 1)).sum(dim=-1)
+    alpha_tilde = y_true + (1.0 - y_true) * alpha
     alpha_tilde_0 = alpha_tilde.sum(dim=-1)
     K = alpha.shape[-1]
-
-    kl_term = (
-        torch.lgamma(alpha_tilde_0)
-        - torch.lgamma(torch.tensor(float(K), device=alpha.device))
-        - torch.lgamma(alpha_tilde).sum(dim=-1)
-        + ((alpha_tilde - 1.0) * (
-            torch.digamma(alpha_tilde) -
-            torch.digamma(alpha_tilde_0.unsqueeze(-1))
-        )).sum(dim=-1)
-    )
+    kl_term = (torch.lgamma(alpha_tilde_0)
+               - torch.lgamma(torch.tensor(float(K), device=alpha.device))
+               - torch.lgamma(alpha_tilde).sum(dim=-1)
+               + ((alpha_tilde - 1.0) * (torch.digamma(alpha_tilde)
+                                         - torch.digamma(alpha_tilde_0.unsqueeze(-1)))).sum(dim=-1))
     return (mse_term + lambda_kl * kl_term).mean()
 
 
 def beta_dirichlet_loss(y_true, params, lambda_kl):
-    """
-    Two independent K=2 Dirichlet (Beta) losses, one per pathogen.
-
-    params:  [α_bac, β_bac, α_fung, β_fung], shape (batch, 4)
-    y_true:  [bac_prob, fung_prob], shape (batch, 2)
-
-    Each pathogen is treated as a binary Dirichlet (Beta distribution):
-        y_bac  = [bac_prob,      1 - bac_prob]    — soft label as (present, absent)
-        y_fung = [fung_prob,     1 - fung_prob]
-        α_bac  = [params[:,0],   params[:,1]]
-        α_fung = [params[:,2],   params[:,3]]
-
-    Loss = dirichlet_loss(y_bac, α_bac) + dirichlet_loss(y_fung, α_fung)
-    The two losses are completely independent — no zero-sum competition.
-    """
-    # Bacterial: binary soft label [p_present, p_absent]
-    y_bac   = torch.stack([y_true[:, 0], 1 - y_true[:, 0]], dim=-1)
-    alpha_bac = params[:, :2]   # [α_bac, β_bac]
-
-    # Fungal: binary soft label [p_present, p_absent]
-    y_fung   = torch.stack([y_true[:, 1], 1 - y_true[:, 1]], dim=-1)
-    alpha_fung = params[:, 2:]  # [α_fung, β_fung]
-
-    loss_bac  = dirichlet_loss(y_bac,  alpha_bac,  lambda_kl)
-    loss_fung = dirichlet_loss(y_fung, alpha_fung, lambda_kl)
-
-    return loss_bac + loss_fung
+    y_bac = torch.stack([y_true[:, 0], 1 - y_true[:, 0]], dim=-1)
+    y_fung = torch.stack([y_true[:, 1], 1 - y_true[:, 1]], dim=-1)
+    return (dirichlet_loss(y_bac, params[:, :2], lambda_kl)
+            + dirichlet_loss(y_fung, params[:, 2:], lambda_kl))
 
 
 def kl_schedule(epoch, total_epochs, lambda_0=1e-4, num_classes=2):
-    """ICMLA paper equation 7."""
+    """ICMLA eq. 7. Negligible at K = 2 (max about 5e-5); kept as published."""
     return (lambda_0 / num_classes) * (epoch / max(total_epochs, 1))
 
 
 def compute_loss(head_type, y_true, output, epoch=0, total_epochs=1):
     if head_type == "sigmoid":
         return rescaled_mse_loss(y_true, output)
-    elif head_type == "dirichlet":
-        lam = kl_schedule(epoch, total_epochs, num_classes=2)
+    lam = kl_schedule(epoch, total_epochs, num_classes=2)
+    if head_type == "dirichlet":
         return dirichlet_loss(y_true, output, lam)
-    else:  # beta_dirichlet
-        lam = kl_schedule(epoch, total_epochs, num_classes=2)
-        return beta_dirichlet_loss(y_true, output, lam)
+    return beta_dirichlet_loss(y_true, output, lam)
 
 
 # =============================================================================
-# METRICS
+# TRAINING
 # =============================================================================
 
-@torch.no_grad()
-def compute_metrics(model, loader, device, threshold=0.5):
-    model.eval()
-    all_preds, all_labels = [], []
-
-    bar = tqdm(loader, desc="  Evaluating", unit="batch", leave=False)
-    for images, labels in bar:
-        result = model.predict(images.to(device))
-        all_preds.append(result["p_hat"].cpu())
-        all_labels.append(labels)
-
-    preds  = torch.cat(all_preds,  dim=0)
-    labels = torch.cat(all_labels, dim=0)
-
-    binary_preds  = (preds  > threshold).float()
-    binary_labels = (labels > threshold).float()
-
-    metrics = {}
-    for i, name in enumerate(["bac", "fung"]):
-        tp = ((binary_preds[:, i] == 1) & (binary_labels[:, i] == 1)).sum().item()
-        fp = ((binary_preds[:, i] == 1) & (binary_labels[:, i] == 0)).sum().item()
-        fn = ((binary_preds[:, i] == 0) & (binary_labels[:, i] == 1)).sum().item()
-        tn = ((binary_preds[:, i] == 0) & (binary_labels[:, i] == 0)).sum().item()
-
-        acc  = (tp + tn) / (tp + tn + fp + fn + 1e-8)
-        prec = tp / (tp + fp + 1e-8)
-        rec  = tp / (tp + fn + 1e-8)
-        f1   = 2 * prec * rec / (prec + rec + 1e-8)
-        metrics[name] = {"accuracy": acc, "f1": f1,
-                         "precision": prec, "recall": rec}
-
-    return metrics, preds.numpy(), labels.numpy()
+def make_optimizer(model, lr, keras):
+    params = [prm for prm in model.parameters() if prm.requires_grad]
+    return torch.optim.Adam(params, lr=lr, eps=1e-7 if keras else 1e-8)
 
 
-# =============================================================================
-# TRAINING LOOP
-# =============================================================================
-
-def train_one_epoch(model, loader, optimizer, epoch, total_epochs, device):
-    model.train()
-    total_loss = 0.0
-    bar = tqdm(loader, desc="  Train", unit="batch", leave=False)
-    for images, labels in bar:
-        images, labels = images.to(device), labels.to(device)
-        optimizer.zero_grad()
-        output = model(images)
-        loss = compute_loss(model.head_type, labels, output, epoch, total_epochs)
-        loss.backward()
+def clip_gradients(model, keras):
+    if keras:  # Keras clipnorm=1 clips each weight's gradient separately
+        for prm in model.parameters():
+            if prm.grad is not None:
+                torch.nn.utils.clip_grad_norm_([prm], max_norm=1.0)
+    else:
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-        optimizer.step()
-        total_loss += loss.item()
+
+
+def train_one_epoch(model, loader, optimizer, epoch, total_epochs, device, accum, keras):
+    model.train()
+    total, n = 0.0, 0
+    optimizer.zero_grad(set_to_none=True)
+    bar = tqdm(loader, desc="  Train", unit="batch", leave=False)
+    for step, (x, y) in enumerate(bar):
+        x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
+        loss = compute_loss(model.head_type, y, model(x), epoch, total_epochs)
+        if not torch.isfinite(loss):
+            raise FloatingPointError(f"Non-finite loss ({loss.item()}) at epoch {epoch + 1}, "
+                                     f"step {step}. Stopping instead of training on NaN.")
+        (loss / accum).backward()
+        if (step + 1) % accum == 0 or (step + 1) == len(loader):
+            clip_gradients(model, keras)
+            optimizer.step()
+            optimizer.zero_grad(set_to_none=True)
+        total += loss.item()
+        n += 1
         bar.set_postfix(loss=f"{loss.item():.4f}")
-    return total_loss / len(loader)
+    return total / max(n, 1)
 
 
 @torch.no_grad()
 def evaluate(model, loader, epoch, total_epochs, device):
     model.eval()
-    total_loss     = 0.0
-    total_evidence = 0.0
-    bar = tqdm(loader, desc="  Val  ", unit="batch", leave=False)
-    for images, labels in bar:
-        images, labels = images.to(device), labels.to(device)
-        output = model(images)
-        loss = compute_loss(model.head_type, labels, output, epoch, total_epochs)
-        total_loss += loss.item()
-        if model.head_type in ("dirichlet", "beta_dirichlet"):
-            result = model.predict(images)
-            total_evidence += result["total_evidence"].mean().item()
-        bar.set_postfix(loss=f"{loss.item():.4f}")
+    total, ev, n = 0.0, 0.0, 0
+    for x, y in tqdm(loader, desc="  Val  ", unit="batch", leave=False):
+        x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
+        out = model(x)
+        total += compute_loss(model.head_type, y, out, epoch, total_epochs).item()
+        if model.head_type == "beta_dirichlet":
+            ev += ((out[:, 0] + out[:, 1] + out[:, 2] + out[:, 3]) / 2).mean().item()
+        elif model.head_type == "dirichlet":
+            ev += out.sum(dim=-1).mean().item()
+        n += 1
+    res = {"val_loss": total / max(n, 1)}
+    if model.head_type != "sigmoid":
+        res["mean_evidence"] = ev / max(n, 1)
+    if not np.isfinite(res["val_loss"]):
+        raise FloatingPointError(f"Non-finite validation loss at epoch {epoch + 1}.")
+    return res
 
-    out = {"loss": total_loss / len(loader)}
-    if model.head_type in ("dirichlet", "beta_dirichlet"):
-        out["mean_evidence"] = total_evidence / len(loader)
-    return out
+
+def log_epoch(log_path, row):
+    pd.DataFrame([row]).to_csv(log_path, mode="a", header=not os.path.exists(log_path), index=False)
 
 
-def train(model, train_loader, val_loader, args, device, out_dir,
-          phase_label="", lr=None, loader_override=None):
-    """
-    Training loop with early stopping.
-
-    Early stopping: if val loss doesn't improve for `args.patience` epochs,
-    stop and restore best weights. Set args.patience=0 to disable.
-
-    lr: override learning rate (used for Phase 2 if --lr_phase2 is set)
-    loader_override: override train_loader (used for Phase 2 if --batch_phase2 is set)
-    """
-    if lr is None:
-        lr = args.lr
-    if loader_override is not None:
-        train_loader = loader_override
-
-    optimizer    = torch.optim.Adam(model.parameters(), lr=lr)
-    weights_path = os.path.join(out_dir, "best_model.pt")
-    log_path     = os.path.join(out_dir, "train_log.csv")
-
-    best_val_loss    = float("inf")
-    best_epoch       = 0
-    epochs_no_improve = 0
-
-    epoch_bar = tqdm(range(args.epochs), desc=f"[{phase_label}]", unit="epoch")
-    for epoch in epoch_bar:
-        train_loss = train_one_epoch(
-            model, train_loader, optimizer, epoch, args.epochs, device
-        )
+def train_paper(model, train_loader, val_loader, args, device, out_dir, keras):
+    """One phase, fixed epochs, no early stopping; the final-epoch model is kept."""
+    optimizer = make_optimizer(model, args.lr, keras)
+    log_path = os.path.join(out_dir, "train_log.csv")
+    best = float("inf")
+    for epoch in range(args.epochs):
+        tl = train_one_epoch(model, train_loader, optimizer, epoch, args.epochs, device,
+                             args.accum, keras)
+        if epoch == 0 and device.type == "cuda":
+            gb = torch.cuda.max_memory_allocated(device) / 1e9
+            tqdm.write(f"  Peak GPU memory after epoch 1: {gb:.1f} GB")
         val = evaluate(model, val_loader, epoch, args.epochs, device)
-
-        improved = val["loss"] < best_val_loss
+        improved = val["val_loss"] < best
         if improved:
-            best_val_loss     = val["loss"]
-            best_epoch        = epoch + 1
-            epochs_no_improve = 0
-            torch.save(model.state_dict(), weights_path)
-        else:
-            epochs_no_improve += 1
-
-        # Log
-        row = {
-            "phase":      phase_label,
-            "epoch":      epoch + 1,
-            "train_loss": train_loss,
-            "val_loss":   val["loss"],
-            "improved":   improved,
-        }
-        if "mean_evidence" in val:
-            row["mean_evidence"] = val["mean_evidence"]
-
-        pd.DataFrame([row]).to_csv(
-            log_path, mode="a",
-            header=not os.path.exists(log_path) or epoch == 0,
-            index=False
-        )
-
-        postfix = {
-            "train": f"{train_loss:.4f}",
-            "val":   f"{val['loss']:.4f}",
-            "best":  f"ep{best_epoch}",
-        }
-        if "mean_evidence" in val:
-            postfix["α₀"] = f"{val['mean_evidence']:.3f}"
-        if not improved:
-            postfix["no_improv"] = f"{epochs_no_improve}"
-        epoch_bar.set_postfix(postfix)
-
-        # Early stopping
-        if args.patience > 0 and epochs_no_improve >= args.patience:
-            tqdm.write(
-                f"  [{phase_label}] Early stopping at epoch {epoch+1} "
-                f"(no improvement for {args.patience} epochs)"
-            )
-            break
-
-    tqdm.write(
-        f"  [{phase_label}] Best val loss: {best_val_loss:.4f} "
-        f"at epoch {best_epoch} — saved to {weights_path}"
-    )
-    # Restore best weights before returning
-    model.load_state_dict(torch.load(weights_path, map_location=device))
+            best = val["val_loss"]
+            torch.save(model.state_dict(), os.path.join(out_dir, "best_val_model.pt"))
+        log_epoch(log_path, {"phase": "paper", "epoch": epoch + 1, "train_loss": tl,
+                             **val, "best_so_far": improved})
+        tqdm.write(f"  epoch {epoch + 1}/{args.epochs}  train {tl:.4f}  val {val['val_loss']:.4f}"
+                   + (f"  evidence {val['mean_evidence']:.3f}" if "mean_evidence" in val else ""))
+    torch.save(model.state_dict(), os.path.join(out_dir, "model.pt"))
     return model
+
+
+def train_legacy(model, loaders, args, device, out_dir):
+    """The previous two-phase schedule, with a checkpoint per phase and the best carried across."""
+    train_loader, train_loader_p2, val_loader = loaders
+    log_path = os.path.join(out_dir, "train_log.csv")
+    best_overall, best_file = float("inf"), None
+    for phase in (1, 2):
+        if phase == 2:
+            model.unfreeze(from_block=54)
+        lr = args.lr if phase == 1 else (args.lr_phase2 or args.lr)
+        loader = train_loader if phase == 1 else train_loader_p2
+        optimizer = make_optimizer(model, lr, keras=False)
+        ckpt = os.path.join(out_dir, f"best_phase{phase}.pt")
+        best, no_imp = float("inf"), 0
+        for epoch in range(args.epochs):
+            tl = train_one_epoch(model, loader, optimizer, epoch, args.epochs, device, args.accum, False)
+            val = evaluate(model, val_loader, epoch, args.epochs, device)
+            improved = val["val_loss"] < best
+            if improved:
+                best, no_imp = val["val_loss"], 0
+                torch.save(model.state_dict(), ckpt)
+            else:
+                no_imp += 1
+            log_epoch(log_path, {"phase": phase, "epoch": epoch + 1, "train_loss": tl, **val,
+                                 "best_so_far": improved})
+            if args.patience > 0 and no_imp >= args.patience:
+                break
+        model.load_state_dict(torch.load(ckpt, map_location=device))
+        if best < best_overall:
+            best_overall, best_file = best, ckpt
+    model.load_state_dict(torch.load(best_file, map_location=device))
+    torch.save(model.state_dict(), os.path.join(out_dir, "model.pt"))
+    return model
+
+
+# =============================================================================
+# TEST PREDICTIONS AND METRICS
+# =============================================================================
+
+@torch.no_grad()
+def predict(model, paths, transform, batch, device, num_workers):
+    ds = KeratitisDataset(paths, np.zeros((len(paths), 2)), transform)
+    loader = DataLoader(ds, batch_size=batch, shuffle=False, num_workers=num_workers,
+                        pin_memory=device.type == "cuda")
+    model.eval()
+    outs = [model(x.to(device)).cpu() for x, _ in tqdm(loader, desc="  Predict", leave=False)]
+    out = torch.cat(outs)
+    return out.numpy(), model.p_hat(out).numpy()
+
+
+def binary_metrics(y, score, p):
+    """AUROC of the bacterial-vs-fungal score and of each pathogen output, accuracy at 0.5."""
+    if len(y) == 0:
+        return {"n_images": 0}
+    m = {"n_images": int(len(y)), "bacterial_share": float(np.mean(y))}
+    if len(np.unique(y)) == 2:
+        m["auroc_binary"] = float(roc_auc_score(y, score))
+        m["auroc_bac_output"] = float(roc_auc_score(y, p[:, 0]))
+        m["auroc_fung_output"] = float(roc_auc_score(1 - y, p[:, 1]))
+    m["accuracy"] = float(np.mean((score > 0.5) == (y == 1)))
+    return m
 
 
 # =============================================================================
 # MAIN
 # =============================================================================
 
-def main():
-    args    = get_args()
+def main(argv=None):
+    args = get_args(argv)
+    seed_everything(args.seed)
+    device = torch.device(args.device or ("cuda" if torch.cuda.is_available() else "cpu"))
+    keras = bool(args.keras_parity)
+
+    # --- Labels and split -----------------------------------------------------
+    df = load_labelled(args.csv, args.img_root, args.group_col)
+    parts = split_by_participant(df, seed=args.seed, group_col=args.group_col)
+    if args.smoke:  # a small random subset of each part
+        rng = np.random.default_rng(args.seed)
+        pick = lambda a, n: np.sort(rng.permutation(a)[:n])
+        parts = {"train": pick(parts["train"], 48), "val": pick(parts["val"], 16),
+                 "cal": pick(parts["cal"], 8), "eval": pick(parts["eval"], 24)}
+        parts["test"] = np.concatenate([parts["cal"], parts["eval"]])
+    tr = parts["train"]
+    if args.exclude_followups_train:
+        tr = tr[~df["is_followup"].to_numpy()[tr]]
+    test = np.concatenate([parts["cal"], parts["eval"]])
+    part_flag = np.r_[np.zeros(len(parts["cal"]), int), np.ones(len(parts["eval"]), int)]
+
+    print(label_summary(df, args.group_col).to_string(), "\n")
+    print(f"Split (grouped by {args.group_col}): train {len(tr):,}, val {len(parts['val']):,}, "
+          f"test {len(test):,} (cal {len(parts['cal']):,} / eval {len(parts['eval']):,})\n")
+
+    # --- Images must all exist before anything trains -------------------------
+    used = np.concatenate([tr, parts["val"], test])
+    missing = [p for p in df["local_path"].to_numpy()[used] if not os.path.exists(p)]
+    if missing:
+        print(f"{len(missing)} image files are missing, e.g.:")
+        for p in missing[:10]:
+            print("  ", p)
+        raise SystemExit("Stopping: fix the image paths before training.")
+    print(f"All {len(used):,} image files found.")
+
+    cfg = resolve_data_config({}, model=timm.create_model(args.backbone, pretrained=False,
+                                                            num_classes=0))
+    mean, std = cfg["mean"], cfg["std"]
+    if args.recipe == "paper":
+        train_tf = KerasStyleAugment(args.img_size, mean, std)
+        eval_tf = eval_transform(args.img_size, mean, std)
+    else:
+        train_tf = legacy_train_transform(args.img_size)
+        eval_tf = eval_transform(args.img_size, [0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+
+    if args.dry_run:
+        bad = 0
+        for s, g in df.iloc[used].groupby("study"):
+            for p in g["local_path"].head(3):
+                try:
+                    Image.open(p).convert("RGB")
+                except Exception as e:
+                    bad += 1
+                    print(f"  cannot read {p}: {e}")
+        print("Dry run finished: labels OK, all files present"
+              + ("." if not bad else f", but {bad} sample images could not be read."))
+        return
+
     out_dir = make_output_dir(args)
 
-    torch.manual_seed(args.seed)
-    np.random.seed(args.seed)
+    # --- Model ----------------------------------------------------------------
+    model = EfficientNetB7(head_type=args.head, dropout=args.dropout,
+                           pretrained=not args.no_pretrained, backbone_name=args.backbone,
+                           drop_path_rate=0.2 if keras else 0.0, keras=keras).to(device)
+    stage = model.set_trainable_last_stage() if args.recipe == "paper" else None
+    n_train_params = count_trainable(model)
+    print(f"Recipe {args.recipe}: trainable parameters {n_train_params:,}"
+          + (f" (backbone.blocks[{stage}] + conv_head + head; backbone BatchNorm frozen)"
+             if stage is not None else " (Phase 1: head only)"))
 
-    if args.device:
-        device = torch.device(args.device)
+    # --- Record everything about the run --------------------------------------
+    config = {**vars(args), "git": git_info(), "trainable_params": n_train_params,
+              "last_stage_index": stage, "norm_mean": list(mean), "norm_std": list(std),
+              "n_train": int(len(tr)), "n_val": int(len(parts["val"])), "n_test": int(len(test)),
+              "started": datetime.now().isoformat(timespec="seconds"),
+              "torch": torch.__version__, "timm": timm.__version__}
+    with open(os.path.join(out_dir, "config.json"), "w") as f:
+        json.dump(config, f, indent=2)
+    split_tab = pd.DataFrame({"csv_row": df["csv_row"].to_numpy()})
+    split_tab["part"] = "unused"
+    for k in ("train", "val", "cal", "eval"):
+        split_tab.loc[parts[k], "part"] = k
+    if args.exclude_followups_train:
+        dropped = np.setdiff1d(parts["train"], tr)
+        split_tab.loc[dropped, "part"] = "train_excluded_followup"
+    split_tab.to_csv(os.path.join(out_dir, "split.csv"), index=False)
+    label_summary(df, args.group_col).to_csv(os.path.join(out_dir, "label_summary.csv"))
+
+    # --- Loaders ----------------------------------------------------------------
+    y_all = targets(df, args.label_type)
+    paths = df["local_path"].to_numpy()
+    g = torch.Generator().manual_seed(args.seed)
+    nw, pin = args.num_workers, device.type == "cuda"
+
+    def loader(idx, tf, batch, shuffle):
+        ds = KeratitisDataset(paths[idx], y_all[idx], tf)
+        drop_last = shuffle and len(ds) % batch == 1  # BatchNorm cannot train on a batch of 1
+        return DataLoader(ds, batch_size=batch, shuffle=shuffle, num_workers=nw, pin_memory=pin,
+                          worker_init_fn=worker_init, generator=g, drop_last=drop_last)
+
+    train_loader = loader(tr, train_tf, args.batch, True)
+    val_loader = loader(parts["val"], eval_tf, args.batch, False)
+
+    # --- Train ------------------------------------------------------------------
+    print(f"\nTraining {args.head} / {args.label_type} / {args.recipe}: {args.epochs} epochs, "
+          f"batch {args.batch} x accum {args.accum}, lr {args.lr}, device {device}\n")
+    if args.recipe == "paper":
+        model = train_paper(model, train_loader, val_loader, args, device, out_dir, keras)
     else:
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Device: {device}\n")
+        p2 = loader(tr, train_tf, args.batch_phase2 or args.batch, True)
+        model = train_legacy(model, (train_loader, p2, val_loader), args, device, out_dir)
 
-    # --- Data ---
-    df = load_dataframe(args.csv, args.img_root)
-    df_train, df_val, df_test = split_dataframe(df, seed=args.seed)
+    # --- Test predictions (no identifiers) ---------------------------------------
+    out, p = predict(model, paths[test], eval_tf, args.batch, device, nw)
+    score = (p[:, 0] + 1.0 - p[:, 1]) / 2.0  # one bacterial probability from the two outputs
+    sub = df.iloc[test]
+    np.savez(os.path.join(out_dir, "test_predictions.npz"),
+             head=args.head, label_type=args.label_type, recipe=args.recipe,
+             output=out, p_hat=p, p_bac_binary=score,
+             y_bac=sub["y_bac"].to_numpy(), soft_bac=sub["soft_bac"].to_numpy(),
+             soft_fung=sub["soft_fung"].to_numpy(), has_posterior=sub["has_posterior"].to_numpy(),
+             is_followup=sub["is_followup"].to_numpy(), visit=sub["visit"].to_numpy().astype(str),
+             study=np.array([STUDY_SHORT.get(s, s) for s in sub["study"]]),
+             csv_row=sub["csv_row"].to_numpy(),
+             participant=participant_codes(df, args.group_col)[test], part=part_flag)
 
-    train_ds = KeratitisDataset(df_train, transform=train_transforms, label_type=args.label_type)
-    val_ds   = KeratitisDataset(df_val,   transform=val_transforms,   label_type=args.label_type)
-    test_ds  = KeratitisDataset(df_test,  transform=val_transforms,   label_type=args.label_type)
-
-    batch_p2 = args.batch_phase2 if args.batch_phase2 else args.batch
-    lr_p2    = args.lr_phase2    if args.lr_phase2    else args.lr
-
-    train_loader    = DataLoader(train_ds, batch_size=args.batch,
-                                 shuffle=True,  num_workers=4, pin_memory=True)
-    train_loader_p2 = DataLoader(train_ds, batch_size=batch_p2,
-                                 shuffle=True,  num_workers=4, pin_memory=True)
-    val_loader      = DataLoader(val_ds,   batch_size=args.batch,
-                                 shuffle=False, num_workers=4, pin_memory=True)
-    test_loader     = DataLoader(test_ds,  batch_size=args.batch,
-                                 shuffle=False, num_workers=4, pin_memory=True)
-
-    # --- Model ---
-    print(f"Building EfficientNetB7 with {args.head} head + {args.label_type} labels...")
-    model = EfficientNetB7(
-        head_type=args.head,
-        dropout=args.dropout,
-        freeze_backbone=True,
-        pretrained=True
-    ).to(device)
-
-    total     = sum(p.numel() for p in model.parameters())
-    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"Total params:     {total:,}")
-    print(f"Trainable params: {trainable:,}  (head only)")
-    if args.patience > 0:
-        print(f"Early stopping:   patience={args.patience}\n")
-    else:
-        print(f"Early stopping:   disabled\n")
-
-    # --- Phase 1: Train head only ---
-    print("=== Phase 1: Train head (backbone frozen) ===")
-    model = train(model, train_loader, val_loader, args, device, out_dir,
-                  phase_label="Phase 1", lr=args.lr)
-
-    # --- Phase 2: Unfreeze and fine-tune ---
-    print("\n=== Phase 2: Unfreeze backbone and fine-tune ===")
-    model.unfreeze(from_block=54)
-    if batch_p2 != args.batch:
-        print(f"  Phase 2 batch size: {batch_p2} (was {args.batch})")
-    if lr_p2 != args.lr:
-        print(f"  Phase 2 learning rate: {lr_p2} (was {args.lr})")
-    model = train(model, train_loader, val_loader, args, device, out_dir,
-                  phase_label="Phase 2", lr=lr_p2,
-                  loader_override=train_loader_p2 if batch_p2 != args.batch else None)
-
-    # --- Test set evaluation ---
-    print("\n=== Test Set Evaluation ===")
-    metrics, preds, labels = compute_metrics(model, test_loader, device)
-
-    try:
-        from sklearn.metrics import roc_auc_score
-        for i, cls in enumerate(["bac", "fung"]):
-            metrics[cls]["auroc"] = roc_auc_score(labels[:, i] > 0.5, preds[:, i])
-    except ImportError:
-        print("  (install scikit-learn for AUROC)")
-
-    for cls in ["bac", "fung"]:
-        m = metrics[cls]
-        print(f"\n  {cls.upper()} keratitis:")
-        for k, v in m.items():
-            print(f"    {k:<12} {v:.4f}")
-
-    metrics_path = os.path.join(out_dir, "test_metrics.json")
-    with open(metrics_path, "w") as f:
+    y = sub["y_bac"].to_numpy()
+    mad = sub["study"].eq("MADURAI photos").to_numpy()
+    ev = part_flag == 1
+    metrics = {"reference": "LCA bin (binary, bacterial vs fungal)",
+               "score": "(p_bac + 1 - p_fung) / 2",
+               "test_all": binary_metrics(y, score, p),
+               "eval": binary_metrics(y[ev], score[ev], p[ev]),
+               "eval_MADURAI": binary_metrics(y[ev & mad], score[ev & mad], p[ev & mad]),
+               "eval_other_studies": binary_metrics(y[ev & ~mad], score[ev & ~mad], p[ev & ~mad])}
+    with open(os.path.join(out_dir, "test_metrics.json"), "w") as f:
         json.dump(metrics, f, indent=2)
-
-    print(f"\nAll outputs saved to: {out_dir}/")
-    print(f"  best_model.pt     — best weights (restored after early stopping)")
-    print(f"  train_log.csv     — per-epoch metrics")
-    print(f"  test_metrics.json — final test results")
-    print(f"  config.json       — run configuration")
+    for k in ("eval", "eval_MADURAI", "eval_other_studies"):
+        m = metrics[k]
+        print(f"  {k:20s} n={m['n_images']:4d}  AUROC {m.get('auroc_binary', float('nan')):.3f}  "
+              f"accuracy {m.get('accuracy', float('nan')):.3f}")
+    with open(os.path.join(out_dir, "config.json")) as f:
+        config = json.load(f)
+    config["finished"] = datetime.now().isoformat(timespec="seconds")
+    with open(os.path.join(out_dir, "config.json"), "w") as f:
+        json.dump(config, f, indent=2)
+    print(f"\nDone. Outputs in {out_dir}: model.pt (final epoch), best_val_model.pt (reference only), "
+          f"train_log.csv, test_predictions.npz, test_metrics.json, split.csv, config.json")
 
 
 if __name__ == "__main__":
