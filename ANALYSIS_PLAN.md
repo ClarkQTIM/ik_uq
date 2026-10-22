@@ -46,7 +46,9 @@ only (the calibration part sets the threshold).
 - H1d label-uncertainty tracking (images with a posterior): AUROC of entropy for ambiguous labels;
   Spearman of model entropy with label entropy. **Primary.**
 - H1e conformal efficiency: two-label rate and coverage at α = 0.1.
-- H1f fidelity to the posterior: mean |p − posterior|.
+- H1f fidelity to the posterior: mean |p − posterior|; Brier against the posterior (added 2026-10-22).
+- Descriptive: mean p(bacterial) and share called bacterial by reference class, per stratum (added
+  2026-10-22, to show whether a soft–hard difference is a shift of the operating point).
 - Also reported: discrimination (AUROC), accuracy.
 
 **H2. Uncertainty differs by stratum** (per model; contrasts in mean uncertainty):
@@ -78,4 +80,8 @@ evidence above the calibration 67th percentile) vs each alone at the same covera
 ## Conformal
 
 Binary LAC, α = 0.1, textbook rank k = ⌈(n + 1)(1 − α)⌉. Calibrated at participant level: one image
-per calibration participant, 200 random draws, median threshold.
+per calibration participant, 1,000 random draws, median threshold. The draws are made once and shared
+by every model (amended 2026-10-22: with 200 draws taken from one shared random stream, the two-label
+rate of a model moved by up to 0.03 depending on which other runs were loaded). Every random stream
+(conformal draws, each stratum's bootstrap) is seeded by name, so a result does not depend on which
+other runs or strata are in the analysis.

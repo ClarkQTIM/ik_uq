@@ -15,6 +15,7 @@ import argparse
 import json
 import os
 import sys
+import zlib
 
 import numpy as np
 import pandas as pd
@@ -146,20 +147,32 @@ def qhat(scores):
     return 1.0 if k > n else s[k - 1]
 
 
-def conformal(p, y, part, fold, grp, rng, draws=200):
-    """Binary LAC per fold, participant-level calibration (one image per participant, median of draws)."""
+def calibration_draws(part, fold, grp, rng, draws=1000):
+    """One image per calibration participant, `draws` times, per fold: an array (draws x participants).
+    Drawn once and shared by every model, so soft/hard and model-to-model comparisons use the same
+    calibration images (common random numbers) and no result depends on which other runs are loaded."""
+    out = {}
+    for f in np.unique(fold):
+        cal = np.where((fold == f) & (part == 0))[0]
+        if len(cal) == 0:
+            raise SystemExit(f"Fold {f} has no calibration images.")
+        members = [cal[grp[cal] == g] for g in np.unique(grp[cal])]
+        out[f] = np.stack([v[rng.integers(0, len(v), draws)] for v in members], 1)
+    return out
+
+
+def conformal(p, y, fold, cal_draws):
+    """Binary LAC per fold, participant-level calibration (median threshold over the shared draws)."""
     P = np.stack([1 - p, p], 1)
     size = np.zeros(len(p), int)
     cover = np.zeros(len(p), bool)
     for f in np.unique(fold):
         m = fold == f
-        cal = np.where(m & (part == 0))[0]
-        if len(cal) == 0:
-            raise SystemExit(f"Fold {f} has no calibration images.")
-        by_g = {g: cal[grp[cal] == g] for g in np.unique(grp[cal])}
-        qs = [qhat(1 - P[ix, y[ix]]) for ix in
-              (np.array([rng.choice(v) for v in by_g.values()]) for _ in range(draws))]
-        q = float(np.median(qs))
+        ix = cal_draws[f]                      # draws x participants
+        s = np.sort(1 - P[ix, y[ix]], axis=1)
+        n = s.shape[1]
+        k = int(np.ceil((n + 1) * (1 - ALPHA)))
+        q = 1.0 if k > n else float(np.median(s[:, k - 1]))
         S = P[m] >= 1 - q
         size[m] = S.sum(1)
         cover[m] = S[np.arange(m.sum()), y[m]]
@@ -223,7 +236,10 @@ def main():
     ap.add_argument("--seed", type=int, default=0)
     a = ap.parse_args()
     os.makedirs(a.out, exist_ok=True)
-    rng = np.random.default_rng(a.seed)
+
+    # Separate, named random streams: a result never depends on which other runs or strata are loaded.
+    def rng_for(*name):
+        return np.random.default_rng([a.seed] + [zlib.crc32(str(x).encode()) for x in name])
 
     data = load_runs(a.runs)
     keys = sorted(data)
@@ -267,16 +283,22 @@ def main():
     print("\nStrata:")
     for k, v in design.items():
         print(f"  {k:42s} {v['images']:5d} images, {v['participants']:4d} participants")
+    names = list(strata)
+    same = [(x, z) for i, x in enumerate(names) for z in names[i + 1:]
+            if strata[x].any() and np.array_equal(strata[x], strata[z])]
+    for x, z in same:
+        print(f"  Note: '{x}' and '{z}' contain exactly the same images.")
 
     # ---- signals per model ---------------------------------------------------
     M = {}
+    cal_draws = calibration_draws(part, fold, grp, rng_for("conformal"))
     for key in keys:
         d = data[key]
         p = d["p_bac_binary"].astype(float)
         H = entropy(p)
         ok = (p > 0.5) == (y == 1)
         ev = d["output"][:, :4].astype(float).sum(1) / 2 if d["head"] != "sigmoid" else None
-        size, cover = conformal(p, y, part, fold, grp, rng)
+        size, cover = conformal(p, y, fold, cal_draws)
         t67 = np.zeros(len(p))
         if ev is not None:  # calibration-set 67th percentile of evidence, per fold
             for f in np.unique(fold):
@@ -285,7 +307,7 @@ def main():
         M[key] = dict(p=p, H=H, ok=ok, ev=ev, low_ev=None if ev is None else -ev,
                       size=size, cover=cover, t67=t67)
 
-    boots = {k: Boot(grp, np.where(m)[0], a.reps, rng) for k, m in strata.items() if m.sum() > 0}
+    boots = {k: Boot(grp, np.where(m)[0], a.reps, rng_for("stratum", k)) for k, m in strata.items() if m.sum() > 0}
     evalm = part == 1
 
     # ---- H1: soft vs hard ----------------------------------------------------
@@ -311,6 +333,8 @@ def main():
          lambda k, i: spearman(m_(k)["H"][i][has_post[i]], Hpost[i][has_post[i]]), +1),
         ("mean |p - posterior|",
          lambda k, i: np.mean(np.abs(m_(k)["p"][i] - post[i])[has_post[i]]) if has_post[i].any() else np.nan, -1),
+        ("Brier against the posterior",
+         lambda k, i: np.mean(((m_(k)["p"][i] - post[i]) ** 2)[has_post[i]]) if has_post[i].any() else np.nan, -1),
         ("conformal coverage (eval)",
          lambda k, i: m_(k)["cover"][i[evalm[i]]].mean() if evalm[i].any() else np.nan, 0),
         ("conformal two-label rate (eval)",
@@ -336,6 +360,22 @@ def main():
         prim = h1["primary"] & h1["p_boot"].notna()
         h1.loc[prim, "p_holm"] = holm(h1.loc[prim, "p_boot"])
     h1.to_csv(os.path.join(a.out, "h1_soft_vs_hard.csv"), index=False)
+
+    # Where the predictions move: mean p(bacterial) by reference class (descriptive; explains H1 shifts)
+    rows = []
+    for s_name, m in strata.items():
+        for cls, cname in ((1, "bacterial"), (0, "fungal")):
+            mc = m & (y == cls)
+            if not mc.any():
+                continue
+            for key in keys:
+                p = M[key]["p"]
+                rows.append({"stratum": s_name, "reference": cname, "model": key[0], "labels": key[1],
+                             "images": int(mc.sum()), "participants": int(len(np.unique(grp[mc]))),
+                             "mean posterior": post[mc & has_post].mean() if (mc & has_post).any() else np.nan,
+                             "mean p(bacterial)": p[mc].mean(), "share called bacterial": (p[mc] > 0.5).mean()})
+    h1c = pd.DataFrame(rows)
+    h1c.to_csv(os.path.join(a.out, "h1_by_reference_class.csv"), index=False)
 
     # ---- H2: uncertainty by stratum -------------------------------------------
     def signals(key):
@@ -369,7 +409,7 @@ def main():
         if sa not in strata or sb not in strata or not strata[sa].any() or not strata[sb].any():
             continue
         ma, mb = strata[sa], strata[sb]
-        bt = Boot(grp, np.where(ma | mb)[0], a.reps, rng)
+        bt = Boot(grp, np.where(ma | mb)[0], a.reps, rng_for("contrast", sa, sb))
         for key in keys:
             for sig_name, sig in signals(key).items():
                 def diff(b, sig=sig):
@@ -505,6 +545,8 @@ def main():
         f.write("# Full analysis (H1-H4 x strata)\n\nSee ANALYSIS_PLAN.md for definitions. "
                 f"Bootstrap over participants, {a.reps} resamples.\n\n")
         f.write("## Strata\n\n" + md(pd.DataFrame(design).T.reset_index().rename(columns={"index": "stratum"})) + "\n\n")
+        for x, z in same:
+            f.write(f"Note: '{x}' and '{z}' contain exactly the same images.\n\n")
         if len(h1):
             f.write("## H1. Soft vs hard\n\n### Primary (MADURAI, Holm-corrected)\n\n"
                     + md(h1[h1.primary], ["model", "metric", "soft", "hard", "soft_minus_hard", "ci_low",
@@ -513,6 +555,7 @@ def main():
                 f.write(f"### {s_name}\n\n" + md(h1[h1.stratum == s_name],
                                                   ["model", "metric", "soft", "hard", "soft_minus_hard",
                                                    "ci_low", "ci_high", "verdict"]) + "\n\n")
+            f.write("### Predictions by reference class\n\n" + md(h1c) + "\n\n")
         f.write("## H2. Uncertainty by stratum\n\n" + md(h2) + "\n\n### Contrasts\n\n" + md(h2c) + "\n\n")
         f.write("### By study (enrolment photos)\n\n" + md(by_study) + "\n\n")
         f.write("## H3. Uncertainty tracks performance\n\n" + md(h3) + "\n\n### Pooled vs within-study\n\n"
