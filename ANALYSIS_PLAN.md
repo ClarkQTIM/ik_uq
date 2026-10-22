@@ -1,0 +1,81 @@
+# Analysis plan (written 2026-10-22, before the cross-validation runs)
+
+Implemented in `src/analyze_full.py`. Every result below is computed for every stratum and reported
+whatever its direction. Reference label: the LCA bin, binary (1 = bacterial, 0 = fungal).
+
+## Models
+
+| Key | Head | KL | Why it is included |
+|---|---|---|---|
+| sigmoid / soft, sigmoid / hard | sigmoid | – | The 2×2 |
+| BD ICMLA / soft, BD ICMLA / hard | Beta-Dirichlet | ICMLA eq. 7 schedule | BD as published |
+| BD Sensoy 1 / soft, BD Sensoy 1 / hard | Beta-Dirichlet | Sensoy form, weight 1, ramp over 10 epochs | Standard evidential setting (Sensoy et al.) |
+
+The BD arms are fixed in advance, not chosen by test-set results. Other KL arms are reported in the
+KL ablation (`src/analyze_kl.py`). With cross-validation, a data-driven BD choice may be added only if
+it is made on each fold's validation set.
+
+Score: p = (p_bac + 1 − p_fung) / 2. Uncertainty signals: entropy of p (every model); low evidence,
+(α_bac + β_bac + α_fung + β_fung) / 2 (BD); a two-label binary conformal set.
+
+## Strata
+
+| Stratum | Definition | Why |
+|---|---|---|
+| All | Every test image | The pooled view the abstract reported |
+| All, enrolment only | Excluding 3-week, 3-month and 12-month photos | Follow-ups inflate performance |
+| Single-etiology trials | MUTT Pilot, MUTT1, MUTT2, SCUT, CLAIR I, CLAIR II; enrolment only | Labels set by study design; confounded with trial |
+| MADURAI | The mixed-etiology study | Same setting, labels from tests: the clinical question |
+| MADURAI, confident label | Posterior ≤ 0.1 or ≥ 0.9 | Concordant evidence |
+| MADURAI, ambiguous label | 0.1 < posterior < 0.9 | Where soft and hard targets differ |
+| MADURAI, one pathogen + | Positive tests for one pathogen only (participant level) | Comparison group |
+| MADURAI, no positive test | Tests recorded, none positive | Least informative tests |
+| MADURAI, co-positive | A bacterial-positive and a fungal-positive test | Discordant tests |
+
+The last three need the raw test columns (the CSV), so they are computed on the server.
+Non-conformal metrics use every test image in the stratum; conformal metrics use the evaluation part
+only (the calibration part sets the threshold).
+
+## Hypotheses and measures
+
+**H1. Soft labels help with uncertainty** (soft − hard, same head and KL arm, paired).
+- H1a calibration: Brier, Murphy reliability (10 bins), calibration error (ECE, 10 bins). **Primary.**
+- H1b error detection: AUROC of entropy (and evidence) for ranking wrong predictions above right ones.
+- H1c selective prediction: accuracy on the 25%, 50% and 75% most confident images; area under the
+  risk–coverage curve (AURC).
+- H1d label-uncertainty tracking (images with a posterior): AUROC of entropy for ambiguous labels;
+  Spearman of model entropy with label entropy. **Primary.**
+- H1e conformal efficiency: two-label rate and coverage at α = 0.1.
+- H1f fidelity to the posterior: mean |p − posterior|.
+- Also reported: discrimination (AUROC), accuracy.
+
+**H2. Uncertainty differs by stratum** (per model; contrasts in mean uncertainty):
+MADURAI − single-etiology; MADURAI confident − single-etiology (setting vs label);
+MADURAI ambiguous − MADURAI confident; no positive test − one pathogen +; co-positive − one pathogen +.
+Per-study means are also tabulated.
+
+**H3. Uncertainty tracks performance:** per stratum, error detection and accuracy by entropy tertile
+(tertiles within the stratum); pooled vs within-study error detection (a pooled value above the
+within-study values means between-study differences drive it); per-study mean uncertainty vs accuracy
+(studies with ≥ 10 images; descriptive).
+
+**H4. How the signals relate** (per model, per stratum): Spearman of entropy with evidence and with
+conformal set size; sigmoid entropy vs BD evidence (same labels); overlap of the 25% most uncertain
+images by entropy and by evidence (Jaccard); combined filter (sigmoid conformal single label + BD
+evidence above the calibration 67th percentile) vs each alone at the same coverage.
+
+## Statistics and decision rules
+
+- 95% intervals: bootstrap over participants (images within a participant are not independent),
+  1,000 resamples, the same resamples for every metric in a stratum.
+- Two-sided bootstrap p-values for paired differences; Holm correction across the primary family
+  (H1a Brier and H1d ambiguous-label AUROC, MADURAI stratum, every soft/hard pair).
+- Verdicts: "holds" (claimed direction, 95% interval excludes 0), "inconclusive", "reversed".
+- With cross-validation: predictions from all folds are pooled (each image predicted once, by a model
+  that never saw it); conformal is calibrated within each fold; per-fold values of AUROC and Brier are
+  also reported to show training variation.
+
+## Conformal
+
+Binary LAC, α = 0.1, textbook rank k = ⌈(n + 1)(1 − α)⌉. Calibrated at participant level: one image
+per calibration participant, 200 random draws, median threshold.
