@@ -92,6 +92,12 @@ def get_args(argv=None):
     p.add_argument("--dropout", type=float, default=0.3)
     p.add_argument("--patience", type=int, default=None, help="early stopping; paper 0 (off)")
     p.add_argument("--keras_parity", type=int, default=None, choices=[0, 1])
+    p.add_argument("--kl_schedule", default="icmla", choices=["icmla", "sensoy"],
+                   help="BD/Dirichlet heads: icmla = ICMLA eq. 7 (default, about 5e-5 at most); "
+                        "sensoy = kl_max * min(1, epoch / 10)")
+    p.add_argument("--kl_max", type=float, default=None, help="full KL weight for --kl_schedule sensoy")
+    p.add_argument("--kl_form", default="sensoy", choices=["sensoy", "icmla_eq5"],
+                   help="sensoy = KL on alpha_tilde (default); icmla_eq5 = KL on alpha")
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--group_col", default="pID", help="column the split is grouped by")
     p.add_argument("--exclude_followups_train", action="store_true",
@@ -112,6 +118,10 @@ def get_args(argv=None):
             setattr(args, k, v)
     if args.smoke:
         args.epochs = 1
+    if args.kl_schedule == "sensoy" and args.kl_max is None:
+        p.error("--kl_schedule sensoy needs --kl_max")
+    if args.kl_schedule == "icmla" and args.kl_max is not None:
+        p.error("--kl_max only applies to --kl_schedule sensoy")
     return args
 
 
@@ -134,7 +144,9 @@ def make_output_dir(args):
         if not args.out_root:
             raise SystemExit("Give --out_root (a folder outside runs/) or --out_dir.")
         ts = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-        name = args.run_name or f"{args.head}_{args.label_type}_{args.recipe}_{ts}"
+        kl = ("" if (args.kl_schedule, args.kl_form) == ("icmla", "sensoy")
+              else f"_kl-{args.kl_schedule}{args.kl_max if args.kl_max is not None else ''}-{args.kl_form}")
+        name = args.run_name or f"{args.head}_{args.label_type}_{args.recipe}{kl}_{ts}"
         if args.smoke:
             name = "SMOKE_" + name
         out_dir = os.path.join(args.out_root, name)
@@ -404,27 +416,47 @@ def rescaled_mse_loss(y_true, y_pred):
     return ((y_true - y_pred) ** 2 * 10).mean()
 
 
-def dirichlet_loss(y_true, alpha, lambda_kl):
-    """Dirichlet MSE + variance term (ICMLA eq. 5) + KL on alpha_tilde (Sensoy et al.)."""
+def dirichlet_kl_to_uniform(a):
+    """KL[Dir(a) || Dir(1, ..., 1)] for each row of a."""
+    a0 = a.sum(dim=-1)
+    K = a.shape[-1]
+    return (torch.lgamma(a0)
+            - torch.lgamma(torch.tensor(float(K), device=a.device))
+            - torch.lgamma(a).sum(dim=-1)
+            + ((a - 1.0) * (torch.digamma(a) - torch.digamma(a0.unsqueeze(-1)))).sum(dim=-1))
+
+
+def dirichlet_loss(y_true, alpha, lambda_kl, kl_form="sensoy"):
+    """
+    Dirichlet MSE + variance term (ICMLA eq. 5) + lambda * KL regulariser.
+      kl_form "sensoy":    KL[Dir(alpha_tilde) || Dir(1)], alpha_tilde = y + (1 - y) * alpha
+                           (Sensoy et al. 2018: evidence for the true class is removed first,
+                           so only misleading evidence is pulled towards uniform). Default.
+      kl_form "icmla_eq5": KL[Dir(alpha) || Dir(1)] (ICMLA eq. 5): all evidence is pulled
+                           towards uniform.
+    alpha comes from a softplus (ICMLA eq. 3), so it can be below 1.
+    """
     alpha_0 = alpha.sum(dim=-1, keepdim=True)
     p_hat = alpha / alpha_0
     mse_term = ((y_true - p_hat) ** 2 + p_hat * (1 - p_hat) / (alpha_0 + 1)).sum(dim=-1)
-    alpha_tilde = y_true + (1.0 - y_true) * alpha
-    alpha_tilde_0 = alpha_tilde.sum(dim=-1)
-    K = alpha.shape[-1]
-    kl_term = (torch.lgamma(alpha_tilde_0)
-               - torch.lgamma(torch.tensor(float(K), device=alpha.device))
-               - torch.lgamma(alpha_tilde).sum(dim=-1)
-               + ((alpha_tilde - 1.0) * (torch.digamma(alpha_tilde)
-                                         - torch.digamma(alpha_tilde_0.unsqueeze(-1)))).sum(dim=-1))
+    if kl_form == "sensoy":
+        kl_term = dirichlet_kl_to_uniform(y_true + (1.0 - y_true) * alpha)
+    elif kl_form == "icmla_eq5":
+        kl_term = dirichlet_kl_to_uniform(alpha)
+    else:
+        raise ValueError(kl_form)
     return (mse_term + lambda_kl * kl_term).mean()
 
 
-def beta_dirichlet_loss(y_true, params, lambda_kl):
+def beta_dirichlet_loss(y_true, params, lambda_kl, kl_form="sensoy"):
     y_bac = torch.stack([y_true[:, 0], 1 - y_true[:, 0]], dim=-1)
     y_fung = torch.stack([y_true[:, 1], 1 - y_true[:, 1]], dim=-1)
-    return (dirichlet_loss(y_bac, params[:, :2], lambda_kl)
-            + dirichlet_loss(y_fung, params[:, 2:], lambda_kl))
+    return (dirichlet_loss(y_bac, params[:, :2], lambda_kl, kl_form)
+            + dirichlet_loss(y_fung, params[:, 2:], lambda_kl, kl_form))
+
+
+# KL settings for this run; set from the command line in main().
+KL = {"schedule": "icmla", "max": None, "form": "sensoy"}
 
 
 def kl_schedule(epoch, total_epochs, lambda_0=1e-4, num_classes=2):
@@ -432,13 +464,24 @@ def kl_schedule(epoch, total_epochs, lambda_0=1e-4, num_classes=2):
     return (lambda_0 / num_classes) * (epoch / max(total_epochs, 1))
 
 
+def kl_weight(epoch, total_epochs):
+    """
+    "icmla":  ICMLA eq. 7, (1e-4 / K) * (epoch / N)  -- the published default.
+    "sensoy": kl_max * min(1, epoch / 10) -- Sensoy et al.'s annealing (kl_max = 1 is theirs);
+              epochs counted from 0, so full weight from the 11th epoch.
+    """
+    if KL["schedule"] == "icmla":
+        return kl_schedule(epoch, total_epochs, num_classes=2)
+    return KL["max"] * min(1.0, epoch / 10.0)
+
+
 def compute_loss(head_type, y_true, output, epoch=0, total_epochs=1):
     if head_type == "sigmoid":
         return rescaled_mse_loss(y_true, output)
-    lam = kl_schedule(epoch, total_epochs, num_classes=2)
+    lam = kl_weight(epoch, total_epochs)
     if head_type == "dirichlet":
-        return dirichlet_loss(y_true, output, lam)
-    return beta_dirichlet_loss(y_true, output, lam)
+        return dirichlet_loss(y_true, output, lam, KL["form"])
+    return beta_dirichlet_loss(y_true, output, lam, KL["form"])
 
 
 # =============================================================================
@@ -522,10 +565,13 @@ def train_paper(model, train_loader, val_loader, args, device, out_dir, keras):
         if improved:
             best = val["val_loss"]
             torch.save(model.state_dict(), os.path.join(out_dir, "best_val_model.pt"))
-        log_epoch(log_path, {"phase": "paper", "epoch": epoch + 1, "train_loss": tl,
-                             **val, "best_so_far": improved})
+        row = {"phase": "paper", "epoch": epoch + 1, "train_loss": tl, **val, "best_so_far": improved}
+        if model.head_type != "sigmoid":
+            row["kl_weight"] = kl_weight(epoch, args.epochs)
+        log_epoch(log_path, row)
         tqdm.write(f"  epoch {epoch + 1}/{args.epochs}  train {tl:.4f}  val {val['val_loss']:.4f}"
-                   + (f"  evidence {val['mean_evidence']:.3f}" if "mean_evidence" in val else ""))
+                   + (f"  evidence {val['mean_evidence']:.3f}  kl_weight {row['kl_weight']:.3g}"
+                      if "mean_evidence" in val else ""))
     torch.save(model.state_dict(), os.path.join(out_dir, "model.pt"))
     return model
 
@@ -601,6 +647,11 @@ def main(argv=None):
     seed_everything(args.seed)
     device = torch.device(args.device or ("cuda" if torch.cuda.is_available() else "cpu"))
     keras = bool(args.keras_parity)
+    KL.update(schedule=args.kl_schedule, max=args.kl_max, form=args.kl_form)
+    if args.head != "sigmoid":
+        print(f"KL regulariser: schedule {args.kl_schedule}"
+              + (f", max weight {args.kl_max}" if args.kl_max is not None else "")
+              + f", form {args.kl_form}\n")
 
     # --- Labels and split -----------------------------------------------------
     df = load_labelled(args.csv, args.img_root, args.group_col)

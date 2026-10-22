@@ -87,3 +87,34 @@ back for the analysis.
   then `git push`.
 - Changes made on the server: commit them and send
   `git bundle create server.bundle <last shared commit>..HEAD` (or the changed files).
+
+## KL ablation (BD cells)
+
+The published ICMLA schedule gives the KL term a weight of at most about 5e-5, so the B and D runs
+were effectively trained without it. The ablation adds four arms for both B (soft) and D (hard),
+weight ramping as `kl_max * min(1, epoch / 10)`:
+
+| Arm | KL form | kl_max |
+|---|---|---|
+| S1 | Sensoy (KL on alpha_tilde; the code's default form) | 1 (Sensoy et al.'s setting) |
+| S0.1 | Sensoy | 0.1 |
+| E1 | ICMLA eq. 5 (KL on alpha) | 1 |
+| S0.01 | Sensoy | 0.01 |
+
+```bash
+OUT_ROOT=/scratch90/chris_/ik_uq_runs DEVICE=cuda:1 scripts/launch_kl_ablation.sh
+```
+
+Eight runs in sequence (about 45 minutes each). Then:
+
+```bash
+R=/scratch90/chris_/ik_uq_runs
+python src/analyze_kl.py --A $R/A_sigmoid_soft_paper_* --C $R/C_sigmoid_hard_paper_* \
+    --bd $R/B_beta_dirichlet_soft_paper_2026-10-21_16-14 $R/D_beta_dirichlet_hard_paper_2026-10-21_16-14 \
+         $R/[BD]_kl*_paper_* --out $R/kl_ablation
+```
+
+Criteria fixed before the runs: (a) on enrolment photos and within MADURAI, evidence flags errors
+at least as well as the model's own entropy; (b) sigmoid conformal singleton + high BD evidence
+beats sigmoid confidence alone at the same coverage. AUROC, Brier and calibration error are
+reported for every arm, and every arm is reported.
