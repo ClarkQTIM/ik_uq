@@ -26,6 +26,18 @@ v2 changes (2026-10-21; see the audit log, findings C1-C4, M1-M2, M9, R1-R5):
   * Outputs go under --out_root and never into a folder called runs/.
   * Writes test_predictions.npz (no identifiers) for the analysis.
 
+v2.1 (2026-10-23):
+  * --n_folds K --fold k: K-fold cross-validation grouped by pID and stratified by study x label
+    (labels.split_cv). The same seed gives the same folds for every model; pool the K runs of a
+    model in the analysis. Without --n_folds the single split is unchanged.
+  * --label_type smear | culture: the paper's test-supervised baselines (supplement section 3).
+    Two sigmoid outputs, each trained on its own test (Gram and KOH, or blood agar and PDA),
+    binary cross-entropy over the tests that were done; results carried across a participant's
+    images. Supplement settings: smear 11 epochs, trainable from Keras layer 753 (last stage);
+    culture 22 epochs, from layer 559 (= start of block 6, timm blocks[5], so two stages train).
+    Only images with at least one of the two tests train; every test image is predicted.
+  * test_predictions.npz also stores the fold and each image's participant-level test results.
+
 Typical use (paper recipe, Cell A):
     python src/model.py --head sigmoid --label_type soft \
         --out_root /scratch90/chris_/ik_uq_runs --device cuda:0
@@ -56,8 +68,9 @@ from torchvision.transforms import InterpolationMode
 from tqdm import tqdm
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from labels import (STUDY_SHORT, label_summary, load_labelled,  # noqa: E402
-                    participant_codes, split_by_participant, targets)
+from labels import (STUDY_SHORT, TEST_TARGETS, TESTS, label_summary,  # noqa: E402
+                    load_labelled, participant_codes, split_by_participant, split_cv,
+                    targets, test_results)
 
 DEFAULT_CSV = ("/persist/QTIM/Active/26-0096/Corneal_Ulcer_Image_Sets/Data/"
                "corneal_ulcer_study_data_7_24_2025_lambda.csv")
@@ -68,6 +81,10 @@ RECIPES = {
     "paper":  dict(epochs=15, batch=32, patience=0, keras_parity=1),
     "legacy": dict(epochs=30, batch=8,  patience=5, keras_parity=0),
 }
+# Supplement section 3, test-supervised baselines (paper recipe). Keras layer 753 = start of the
+# last stage (timm blocks[6]); layer 559 = start of block 6 (timm blocks[5]).
+TEST_RECIPES = {"smear": dict(epochs=11, trainable_stages=1),
+                "culture": dict(epochs=22, trainable_stages=2)}
 
 
 # =============================================================================
@@ -79,7 +96,8 @@ def get_args(argv=None):
     p.add_argument("--csv", default=DEFAULT_CSV)
     p.add_argument("--img_root", default=DEFAULT_IMG_ROOT)
     p.add_argument("--head", default="sigmoid", choices=["sigmoid", "dirichlet", "beta_dirichlet"])
-    p.add_argument("--label_type", default="soft", choices=["soft", "hard"])
+    p.add_argument("--label_type", default="soft", choices=["soft", "hard"] + list(TEST_TARGETS),
+                   help="soft / hard: LCA labels; smear / culture: test-supervised baselines")
     p.add_argument("--recipe", default="paper", choices=list(RECIPES))
     p.add_argument("--epochs", type=int, default=None, help="paper 15; legacy 30 per phase")
     p.add_argument("--batch", type=int, default=None, help="paper 32; legacy 8")
@@ -98,6 +116,11 @@ def get_args(argv=None):
     p.add_argument("--kl_max", type=float, default=None, help="full KL weight for --kl_schedule sensoy")
     p.add_argument("--kl_form", default="sensoy", choices=["sensoy", "icmla_eq5"],
                    help="sensoy = KL on alpha_tilde (default); icmla_eq5 = KL on alpha")
+    p.add_argument("--trainable_stages", type=int, default=None,
+                   help="paper recipe: number of final backbone stages that train (1 = Keras layer "
+                        "753 onward, the default; culture baseline 2 = layer 559 onward)")
+    p.add_argument("--n_folds", type=int, default=0, help="cross-validation folds (0 = single split)")
+    p.add_argument("--fold", type=int, default=None, help="which fold is the test set (0-based)")
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--group_col", default="pID", help="column the split is grouped by")
     p.add_argument("--exclude_followups_train", action="store_true",
@@ -113,6 +136,22 @@ def get_args(argv=None):
     p.add_argument("--dry_run", action="store_true", help="check labels and images, then exit")
     p.add_argument("--smoke", action="store_true", help="tiny end-to-end run to test the pipeline")
     args = p.parse_args(argv)
+    if args.label_type in TEST_TARGETS:
+        if args.head != "sigmoid":
+            p.error("--label_type smear / culture needs --head sigmoid (the paper's baselines)")
+        if args.recipe == "paper":
+            for k, v in TEST_RECIPES[args.label_type].items():
+                if getattr(args, k) is None:
+                    setattr(args, k, v)
+    if args.trainable_stages is None:
+        args.trainable_stages = 1
+    if args.n_folds:
+        if args.n_folds < 2:
+            p.error("--n_folds must be at least 2 (or 0 for the single split)")
+        if args.fold is None or not 0 <= args.fold < args.n_folds:
+            p.error(f"--n_folds {args.n_folds} needs --fold between 0 and {args.n_folds - 1}")
+    elif args.fold is not None:
+        p.error("--fold needs --n_folds")
     for k, v in RECIPES[args.recipe].items():
         if getattr(args, k) is None:
             setattr(args, k, v)
@@ -146,7 +185,8 @@ def make_output_dir(args):
         ts = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
         kl = ("" if (args.kl_schedule, args.kl_form) == ("icmla", "sensoy")
               else f"_kl-{args.kl_schedule}{args.kl_max if args.kl_max is not None else ''}-{args.kl_form}")
-        name = args.run_name or f"{args.head}_{args.label_type}_{args.recipe}{kl}_{ts}"
+        fold = f"_fold{args.fold}of{args.n_folds}" if args.n_folds else ""
+        name = args.run_name or f"{args.head}_{args.label_type}_{args.recipe}{kl}{fold}_{ts}"
         if args.smoke:
             name = "SMOKE_" + name
         out_dir = os.path.join(args.out_root, name)
@@ -364,18 +404,23 @@ class EfficientNetB7(nn.Module):
                     m.eval()
         return self
 
-    def set_trainable_last_stage(self):
+    def set_trainable_last_stage(self, n_stages=1):
         """
         Paper recipe: train from Keras layer 753 (start of block 7, the last stage) onward,
-        i.e. timm backbone.blocks[-1] and conv_head, plus the head. Every backbone
+        i.e. timm backbone.blocks[-1] and conv_head, plus the head (n_stages = 1). The culture
+        baseline trains from layer 559, the start of block 6 (n_stages = 2). Every backbone
         BatchNorm stays frozen and in inference mode, as in the demo's unfreeze loop.
         Parameters are set per module (recurse=False) so containers cannot re-enable BN.
+        Returns the index of the first trainable stage.
         """
         self.freeze_backbone_bn = True
         for prm in self.backbone.parameters():
             prm.requires_grad = False
-        last = len(self.backbone.blocks) - 1
-        prefixes = (f"blocks.{last}.", "conv_head")
+        n_blocks = len(self.backbone.blocks)
+        if not 1 <= n_stages <= n_blocks:
+            raise ValueError(f"n_stages must be in 1..{n_blocks}")
+        first = n_blocks - n_stages
+        prefixes = tuple(f"blocks.{i}." for i in range(first, n_blocks)) + ("conv_head",)
         for name, m in self.backbone.named_modules():
             if not name.startswith(prefixes) or isinstance(m, BN_TYPES):
                 continue
@@ -384,7 +429,7 @@ class EfficientNetB7(nn.Module):
         for prm in self.head.parameters():
             prm.requires_grad = True
         self.train(self.training)
-        return last
+        return first
 
     def unfreeze(self, from_block=54):
         """Legacy recipe only: the old Phase 2 unfreeze, unchanged (see audit M1)."""
@@ -414,6 +459,22 @@ def count_trainable(model):
 def rescaled_mse_loss(y_true, y_pred):
     """The paper's loss: MSE x 10."""
     return ((y_true - y_pred) ** 2 * 10).mean()
+
+
+def masked_bce_loss(y_true, y_pred):
+    """Binary cross-entropy per output over the tests that were done (NaN = not done).
+    Probabilities clipped at 1e-7 as Keras does."""
+    obs = ~torch.isnan(y_true)
+    if not obs.any():
+        return y_pred.sum() * 0.0
+    p = y_pred.clamp(1e-7, 1 - 1e-7)
+    y = torch.nan_to_num(y_true)
+    bce = -(y * torch.log(p) + (1 - y) * torch.log(1 - p))
+    return bce[obs].mean()
+
+
+# Loss for sigmoid heads; set in main(): "mse" (latent supervision) or "bce" (test baselines).
+LOSS = {"kind": "mse"}
 
 
 def dirichlet_kl_to_uniform(a):
@@ -477,7 +538,7 @@ def kl_weight(epoch, total_epochs):
 
 def compute_loss(head_type, y_true, output, epoch=0, total_epochs=1):
     if head_type == "sigmoid":
-        return rescaled_mse_loss(y_true, output)
+        return masked_bce_loss(y_true, output) if LOSS["kind"] == "bce" else rescaled_mse_loss(y_true, output)
     lam = kl_weight(epoch, total_epochs)
     if head_type == "dirichlet":
         return dirichlet_loss(y_true, output, lam, KL["form"])
@@ -648,6 +709,8 @@ def main(argv=None):
     device = torch.device(args.device or ("cuda" if torch.cuda.is_available() else "cpu"))
     keras = bool(args.keras_parity)
     KL.update(schedule=args.kl_schedule, max=args.kl_max, form=args.kl_form)
+    test_supervised = args.label_type in TEST_TARGETS
+    LOSS["kind"] = "bce" if test_supervised else "mse"
     if args.head != "sigmoid":
         print(f"KL regulariser: schedule {args.kl_schedule}"
               + (f", max weight {args.kl_max}" if args.kl_max is not None else "")
@@ -655,25 +718,39 @@ def main(argv=None):
 
     # --- Labels and split -----------------------------------------------------
     df = load_labelled(args.csv, args.img_root, args.group_col)
-    parts = split_by_participant(df, seed=args.seed, group_col=args.group_col)
+    if args.n_folds:
+        parts = split_cv(df, args.n_folds, args.fold, seed=args.seed, group_col=args.group_col)
+        split_desc = f"fold {args.fold} of {args.n_folds}, stratified by study x label"
+    else:
+        parts = split_by_participant(df, seed=args.seed, group_col=args.group_col)
+        split_desc = "single split"
+    y_all = targets(df, args.label_type, args.group_col)
+    no_target = np.isnan(y_all).all(axis=1)  # test-supervised: neither test done
+    tr, va = parts["train"], parts["val"]
+    if test_supervised:  # only images with at least one of the two tests can train
+        tr, va = tr[~no_target[tr]], va[~no_target[va]]
     if args.smoke:  # a small random subset of each part
         rng = np.random.default_rng(args.seed)
         pick = lambda a, n: np.sort(rng.permutation(a)[:n])
-        parts = {"train": pick(parts["train"], 48), "val": pick(parts["val"], 16),
-                 "cal": pick(parts["cal"], 8), "eval": pick(parts["eval"], 24)}
-        parts["test"] = np.concatenate([parts["cal"], parts["eval"]])
-    tr = parts["train"]
+        tr, va = pick(tr, 48), pick(va, 16)
+        parts = {**parts, "cal": pick(parts["cal"], 8), "eval": pick(parts["eval"], 24)}
     if args.exclude_followups_train:
         tr = tr[~df["is_followup"].to_numpy()[tr]]
     test = np.concatenate([parts["cal"], parts["eval"]])
     part_flag = np.r_[np.zeros(len(parts["cal"]), int), np.ones(len(parts["eval"]), int)]
 
     print(label_summary(df, args.group_col).to_string(), "\n")
-    print(f"Split (grouped by {args.group_col}): train {len(tr):,}, val {len(parts['val']):,}, "
-          f"test {len(test):,} (cal {len(parts['cal']):,} / eval {len(parts['eval']):,})\n")
+    print(f"Split ({split_desc}, grouped by {args.group_col}): train {len(tr):,}, val {len(va):,}, "
+          f"test {len(test):,} (cal {len(parts['cal']):,} / eval {len(parts['eval']):,})")
+    if test_supervised:
+        cols = TEST_TARGETS[args.label_type]
+        print(f"Test-supervised ({args.label_type}: {cols[0]}, {cols[1]}): training uses images with at "
+              f"least one of the two tests; {int((~no_target[parts['train']]).sum()):,} of "
+              f"{len(parts['train']):,} training images. Every test image is predicted.")
+    print()
 
     # --- Images must all exist before anything trains -------------------------
-    used = np.concatenate([tr, parts["val"], test])
+    used = np.concatenate([tr, va, test])
     missing = [p for p in df["local_path"].to_numpy()[used] if not os.path.exists(p)]
     if missing:
         print(f"{len(missing)} image files are missing, e.g.:")
@@ -711,32 +788,34 @@ def main(argv=None):
     model = EfficientNetB7(head_type=args.head, dropout=args.dropout,
                            pretrained=not args.no_pretrained, backbone_name=args.backbone,
                            drop_path_rate=0.2 if keras else 0.0, keras=keras).to(device)
-    stage = model.set_trainable_last_stage() if args.recipe == "paper" else None
+    stage = model.set_trainable_last_stage(args.trainable_stages) if args.recipe == "paper" else None
     n_train_params = count_trainable(model)
     print(f"Recipe {args.recipe}: trainable parameters {n_train_params:,}"
-          + (f" (backbone.blocks[{stage}] + conv_head + head; backbone BatchNorm frozen)"
+          + (f" (backbone.blocks[{stage}:] + conv_head + head; backbone BatchNorm frozen)"
              if stage is not None else " (Phase 1: head only)"))
 
     # --- Record everything about the run --------------------------------------
     config = {**vars(args), "git": git_info(), "trainable_params": n_train_params,
-              "last_stage_index": stage, "norm_mean": list(mean), "norm_std": list(std),
-              "n_train": int(len(tr)), "n_val": int(len(parts["val"])), "n_test": int(len(test)),
+              "first_trainable_stage": stage, "norm_mean": list(mean), "norm_std": list(std),
+              "loss": "binary cross-entropy over tests done" if test_supervised else
+                      ("rescaled MSE" if args.head == "sigmoid" else "evidential"),
+              "split": split_desc,
+              "n_train": int(len(tr)), "n_val": int(len(va)), "n_test": int(len(test)),
               "started": datetime.now().isoformat(timespec="seconds"),
               "torch": torch.__version__, "timm": timm.__version__}
     with open(os.path.join(out_dir, "config.json"), "w") as f:
         json.dump(config, f, indent=2)
     split_tab = pd.DataFrame({"csv_row": df["csv_row"].to_numpy()})
     split_tab["part"] = "unused"
-    for k in ("train", "val", "cal", "eval"):
+    for k in ("cal", "eval"):
         split_tab.loc[parts[k], "part"] = k
-    if args.exclude_followups_train:
-        dropped = np.setdiff1d(parts["train"], tr)
-        split_tab.loc[dropped, "part"] = "train_excluded_followup"
+    for k, used_idx in (("train", tr), ("val", va)):
+        split_tab.loc[parts[k], "part"] = f"{k}_not_used"  # no test (baselines), follow-up, smoke
+        split_tab.loc[used_idx, "part"] = k
     split_tab.to_csv(os.path.join(out_dir, "split.csv"), index=False)
     label_summary(df, args.group_col).to_csv(os.path.join(out_dir, "label_summary.csv"))
 
     # --- Loaders ----------------------------------------------------------------
-    y_all = targets(df, args.label_type)
     paths = df["local_path"].to_numpy()
     g = torch.Generator().manual_seed(args.seed)
     nw, pin = args.num_workers, device.type == "cuda"
@@ -748,10 +827,10 @@ def main(argv=None):
                           worker_init_fn=worker_init, generator=g, drop_last=drop_last)
 
     train_loader = loader(tr, train_tf, args.batch, True)
-    val_loader = loader(parts["val"], eval_tf, args.batch, False)
+    val_loader = loader(va, eval_tf, args.batch, False)
 
     # --- Train ------------------------------------------------------------------
-    print(f"\nTraining {args.head} / {args.label_type} / {args.recipe}: {args.epochs} epochs, "
+    print(f"\nTraining {args.head} / {args.label_type} / {args.recipe} ({config['loss']}): {args.epochs} epochs, "
           f"batch {args.batch} x accum {args.accum}, lr {args.lr}, device {device}\n")
     if args.recipe == "paper":
         model = train_paper(model, train_loader, val_loader, args, device, out_dir, keras)
@@ -771,7 +850,10 @@ def main(argv=None):
              is_followup=sub["is_followup"].to_numpy(), visit=sub["visit"].to_numpy().astype(str),
              study=np.array([STUDY_SHORT.get(s, s) for s in sub["study"]]),
              csv_row=sub["csv_row"].to_numpy(),
-             participant=participant_codes(df, args.group_col)[test], part=part_flag)
+             participant=participant_codes(df, args.group_col)[test], part=part_flag,
+             fold=-1 if args.fold is None else args.fold, n_folds=args.n_folds,
+             train_target=y_all[test], test_results=test_results(df, args.group_col)[test],
+             test_cols=np.array(TESTS))
 
     y = sub["y_bac"].to_numpy()
     mad = sub["study"].eq("MADURAI photos").to_numpy()
@@ -782,6 +864,14 @@ def main(argv=None):
                "eval": binary_metrics(y[ev], score[ev], p[ev]),
                "eval_MADURAI": binary_metrics(y[ev & mad], score[ev & mad], p[ev & mad]),
                "eval_other_studies": binary_metrics(y[ev & ~mad], score[ev & ~mad], p[ev & ~mad])}
+    if test_supervised:  # each output against its own test, where the test was done
+        own = {}
+        for j, col in enumerate(TEST_TARGETS[args.label_type]):
+            t = y_all[test][:, j]
+            m = ~np.isnan(t)
+            own[col] = {"n_images": int(m.sum()), "positive_share": float(np.mean(t[m])) if m.any() else None,
+                        "auroc": float(roc_auc_score(t[m], p[m, j])) if len(np.unique(t[m])) == 2 else None}
+        metrics["own_tests"] = own
     with open(os.path.join(out_dir, "test_metrics.json"), "w") as f:
         json.dump(metrics, f, indent=2)
     for k in ("eval", "eval_MADURAI", "eval_other_studies"):

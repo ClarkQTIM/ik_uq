@@ -33,6 +33,10 @@ import pandas as pd
 from sklearn.model_selection import GroupShuffleSplit
 
 PACS_PREFIX = "/pacs/OSHU/Corneal_Ulcer_Image_Sets"
+# Smear and culture columns: 1 positive, 0 negative, -1 missing.
+TESTS = ["bac_smear", "fung_smear", "bac_cult_positive", "fung_cult_positive"]
+TEST_TARGETS = {"smear": ["bac_smear", "fung_smear"],                    # Gram, KOH
+                "culture": ["bac_cult_positive", "fung_cult_positive"]}  # blood agar, PDA
 FOLLOWUP_VISITS = {"3 weeks", "3 months", "12 months", "3E (unclear)"}
 STUDY_SHORT = {
     "MADURAI photos": "MADURAI", "MUTT2-Pictures": "MUTT2",
@@ -162,12 +166,34 @@ def label_summary(df, group_col="pID"):
     return out
 
 
-def targets(df, label_type):
-    """Training targets, shape (N, 2): [bacterial, fungal]."""
+def test_results(df, group_col="pID"):
+    """
+    Smear and culture results per image, carried across each participant's images
+    (results never conflict within a participant; some of a participant's images
+    lack them). Shape (N, 4) in TESTS order: 1 positive, 0 negative, NaN missing.
+    """
+    t = df[[group_col] + TESTS].copy()
+    for c in TESTS:
+        t[c] = t[c].where(t[c] >= 0)
+    per_participant = t.groupby(group_col)[TESTS].max()
+    return per_participant.reindex(df[group_col]).to_numpy(dtype=np.float32)
+
+
+def targets(df, label_type, group_col="pID"):
+    """
+    Training targets, shape (N, 2): [bacterial, fungal].
+      soft / hard      the LCA label rule (complementary).
+      smear / culture  the raw tests as two independent targets (Gram, KOH or blood agar,
+                       PDA), carried across the participant's images; NaN where missing.
+                       Not complementary: [1, 1] and [0, 0] occur.
+    """
     if label_type == "soft":
         return df[["soft_bac", "soft_fung"]].to_numpy(dtype=np.float32)
     if label_type == "hard":
         return df[["hard_bac", "hard_fung"]].to_numpy(dtype=np.float32)
+    if label_type in TEST_TARGETS:
+        cols = [TESTS.index(c) for c in TEST_TARGETS[label_type]]
+        return test_results(df, group_col)[:, cols]
     raise ValueError(label_type)
 
 
@@ -193,6 +219,46 @@ def split_by_participant(df, seed=42, group_col="pID"):
     ca, ev = te[ca_rel], te[ev_rel]
     parts = {"train": tr, "val": va, "test": te, "cal": ca, "eval": ev}
     # no participant in more than one of train / val / test, or of cal / eval
+    for a, b in [("train", "val"), ("train", "test"), ("val", "test"), ("cal", "eval")]:
+        shared = set(groups[parts[a]]) & set(groups[parts[b]])
+        if shared:
+            raise AssertionError(f"{len(shared)} participants are in both {a} and {b}.")
+    return parts
+
+
+def split_cv(df, n_folds=5, fold=0, seed=42, group_col="pID", val_share=0.15):
+    """
+    Cross-validation split, grouped by participant and stratified by study x label so every
+    fold has its share of each study (and of bacterial and fungal MADURAI participants).
+      test  = fold `fold` of `n_folds` (StratifiedGroupKFold, shuffled with `seed`)
+      val   = `val_share` of all participants, taken from the other folds
+      train = the rest of the other folds
+      test is then split 20/80 into calibration / evaluation, grouped by participant.
+    Same seed for every model, so a fold holds the same participants in every run.
+    """
+    try:
+        from sklearn.model_selection import StratifiedGroupKFold
+    except ImportError as e:  # scikit-learn < 1.0
+        raise SystemExit("Cross-validation needs scikit-learn >= 1.0 (StratifiedGroupKFold).") from e
+    if not 0 <= fold < n_folds:
+        raise ValueError(f"fold must be in 0..{n_folds - 1}")
+    groups = df[group_col].to_numpy()
+    strat = (df["study"].astype(str) + "|" + df["y_bac"].astype(str)).to_numpy()
+    idx = np.arange(len(df))
+    import warnings
+    with warnings.catch_warnings():  # small studies (CLAIR I) can't fill every fold; that's fine
+        warnings.filterwarnings("ignore", message="The least populated class")
+        folds = list(StratifiedGroupKFold(n_splits=n_folds, shuffle=True, random_state=seed)
+                     .split(idx, strat, groups))
+    rest, te = folds[fold]
+    va_size = val_share / (1 - 1 / n_folds)  # share of the remaining participants
+    tr_rel, va_rel = next(GroupShuffleSplit(1, test_size=va_size, random_state=seed)
+                          .split(rest, groups=groups[rest]))
+    tr, va = rest[tr_rel], rest[va_rel]
+    ca_rel, ev_rel = next(GroupShuffleSplit(1, test_size=0.80, random_state=seed)
+                          .split(te, groups=groups[te]))
+    ca, ev = te[ca_rel], te[ev_rel]
+    parts = {"train": tr, "val": va, "test": te, "cal": ca, "eval": ev}
     for a, b in [("train", "val"), ("train", "test"), ("val", "test"), ("cal", "eval")]:
         shared = set(groups[parts[a]]) & set(groups[parts[b]])
         if shared:

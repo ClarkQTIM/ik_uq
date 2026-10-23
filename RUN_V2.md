@@ -118,3 +118,51 @@ Criteria fixed before the runs: (a) on enrolment photos and within MADURAI, evid
 at least as well as the model's own entropy; (b) sigmoid conformal singleton + high BD evidence
 beats sigmoid confidence alone at the same coverage. AUROC, Brier and calibration error are
 reported for every arm, and every arm is reported.
+
+## Cross-validation (v2.1)
+
+5 folds grouped by pID and stratified by study × label (`labels.split_cv`): each participant is in
+the test set of exactly one fold, so every image gets one prediction from a model that never saw
+it. Within a fold, 15% of all participants (from the other folds) are validation, the rest train,
+and the test fold is split 20/80 into calibration/evaluation as before. The same seed gives the
+same folds for every setup, so soft and hard (and every other pair) are compared on identical
+participants.
+
+Eight setups × 5 folds = 40 runs:
+
+| Setup | Head / labels | Notes |
+|---|---|---|
+| A, C | sigmoid / soft, hard | the 2×2 |
+| B, D | BD / soft, hard | ICMLA KL as published |
+| BS1, DS1 | BD / soft, hard | Sensoy KL, weight 1 |
+| SM | sigmoid / smear | Gram and KOH as two separate targets; BCE; 11 epochs (supplement) |
+| CU | sigmoid / culture | blood agar and PDA; BCE; 22 epochs; trains from Keras layer 559 (timm `blocks[5]`) |
+
+SM and CU are the paper's test-supervised baselines, which were never trained in the old code.
+Their targets are the raw tests (carried across a participant's images), so [1, 1] and [0, 0]
+occur; only images with at least one of the two tests train, and every test image is predicted.
+
+```bash
+cd /scratch90/chris_/ik_uq
+git pull /scratch90/chris_/ik_uq_cv.bundle v2-paper-recipe && git push
+DRY_RUN=1 OUT_ROOT=/scratch90/chris_/ik_uq_cv scripts/launch_cv.sh     # print the plan
+python src/model.py --dry_run --n_folds 5 --fold 0                     # split sizes for one fold
+OUT_ROOT=/scratch90/chris_/ik_uq_cv scripts/launch_cv.sh               # start (two GPUs)
+```
+
+Runs go fold by fold, round-robin over `DEVICES` (default `cuda:0 cuda:1`); a failed run doesn't
+stop its chain. Rough time: about 45 minutes per LCA-label run, 20 for SM, 40 for CU, so about
+5.5 GPU-hours per fold, 27 in all (about 14 on two GPUs). For one GPU: `DEVICES="cuda:1"`.
+A subset: `SETUPS="A C" FOLDS="0"`.
+
+Analysis, once runs finish (partial folds work too; each setup is pooled over the folds present):
+
+```bash
+C=/scratch90/chris_/ik_uq_cv; R=/scratch90/chris_/ik_uq_runs
+python src/analyze_full.py --runs $C/*_f[0-9]_* --out $C/analysis_all
+# the same, leaving out the 837 images of the v2 single-split test set (hypotheses generated there)
+python src/analyze_full.py --runs $C/*_f[0-9]_* --out $C/analysis_new_images \
+    --exclude_rows_from $R/A_sigmoid_soft_paper_2026-10-21_16-14
+```
+
+No `--csv` is needed: v2.1 runs carry each image's test results. Send back `report.md` from each.

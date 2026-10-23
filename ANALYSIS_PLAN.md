@@ -85,3 +85,38 @@ by every model (amended 2026-10-22: with 200 draws taken from one shared random 
 rate of a model moved by up to 0.03 depending on which other runs were loaded). Every random stream
 (conformal draws, each stratum's bootstrap) is seeded by name, so a result does not depend on which
 other runs or strata are in the analysis.
+
+## Amendment, 23 Oct 2026: cross-validation, the head gap, and test-supervised baselines
+
+Written before any cross-validation run.
+
+**Design.** 5 folds grouped by pID, stratified by study × label, seed 42; every image predicted
+once; per-fold calibration/evaluation split 20/80 as before. Setups: sigmoid soft/hard, BD ICMLA
+soft/hard, BD Sensoy 1 soft/hard (all as above), plus the smear- and culture-supervised baselines.
+Hypotheses H1–H4, strata and statistics as above, on the pooled out-of-fold predictions.
+
+**Reading rule** (proposed; to be confirmed before results): a soft − hard difference counts if it
+has the same sign in at least 4 of 5 folds and the pooled interval excludes 0. Per-fold AUROC and
+Brier are in the report.
+
+**H5, the gap between the two outputs, d = p_bac + p_fung − 1 (exploratory).** Generated on the
+v2 single split, so tested twice: on all images, and leaving out the 837 v2 test images
+(`--exclude_rows_from`); only the second counts as a test. Expected directions:
+- errors have lower d (BD): entropy + gap beats entropy for error detection (logistic regression
+  fitted on each fold's calibration images, AUROC on evaluation images);
+- MADURAI negative-test patients have lower d than one-pathogen-positive patients;
+- MADURAI co-positive patients have higher d than one-pathogen-positive patients;
+- 12-month photos have lower d than enrolment photos of the same studies.
+
+**H6, the two outputs as a joint.** For each MADURAI image with both tests of a pair (cultures;
+smears): the product rule P(both) = p_bac × p_fung against the observed both-positive share, with a
+participant-bootstrap interval for the difference; AUROC of P(both) for both-positive and of
+P(neither) for both-negative. For the smear- and culture-supervised baselines, observed below
+expected means the two tests stay negatively dependent even given the image, i.e. the outputs
+should not be combined as independent. For the LCA-label models the comparison is descriptive.
+
+**Test-supervised baselines.** Targets: Gram and KOH (smear) or blood agar and PDA (culture), each
+its own sigmoid output, binary cross-entropy over the tests done, results carried across a
+participant's images; supplement settings (smear 11 epochs from layer 753; culture 22 epochs from
+layer 559). Scored against the LCA bin like every other model (score (p_bac + 1 − p_fung) / 2), and
+each output against its own test.

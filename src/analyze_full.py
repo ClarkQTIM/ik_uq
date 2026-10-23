@@ -26,6 +26,10 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 ALPHA = 0.1
 ARRAY_KEYS = ["output", "p_hat", "p_bac_binary", "y_bac", "soft_bac", "has_posterior", "is_followup",
               "study", "csv_row", "participant", "part"]
+OPTIONAL_KEYS = ["visit", "test_results"]  # used when every run has them (test_results: v2.1 runs)
+TESTS = ["bac_smear", "fung_smear", "bac_cult_positive", "fung_cult_positive"]
+TEST_PAIRS = {"cultures (blood agar, PDA)": ("bac_cult_positive", "fung_cult_positive"),
+              "smears (Gram, KOH)": ("bac_smear", "fung_smear")}
 
 
 # =============================================================================
@@ -61,7 +65,8 @@ def load_runs(dirs):
         if len(set(folds)) != len(folds):
             raise SystemExit(f"{key[0]} / {key[1]}: more than one run for the same fold:\n  "
                              + "\n  ".join(d for _, _, d in runs))
-        cat = {k: np.concatenate([z[k] for _, z, _ in runs]) for k in ARRAY_KEYS}
+        keys_here = ARRAY_KEYS + [k for k in OPTIONAL_KEYS if all(k in z for _, z, _ in runs)]
+        cat = {k: np.concatenate([z[k] for _, z, _ in runs]) for k in keys_here}
         cat["fold"] = np.concatenate([np.full(len(z["csv_row"]), f) for f, z, _ in runs])
         order = np.argsort(cat["csv_row"], kind="stable")
         cat = {k: v[order] for k, v in cat.items()}
@@ -138,6 +143,38 @@ def spearman(a, b):
     if len(a) < 3 or np.all(a == a[0]) or np.all(b == b[0]):
         return np.nan
     return spearmanr(a, b)[0]
+
+
+def test_groups(tr):
+    """Participant test group per image from the carried test results (N x 4, TESTS order, NaN missing);
+    same categories as copositive_check.participant_groups."""
+    t = {c: tr[:, j] for j, c in enumerate(TESTS)}
+    has = ~np.isnan(tr).all(axis=1)
+    bac = (t["bac_smear"] == 1) | (t["bac_cult_positive"] == 1)
+    fung = (t["fung_smear"] == 1) | (t["fung_cult_positive"] == 1)
+    cat = np.full(len(tr), "no test results", dtype=object)
+    cat[has & ~bac & ~fung] = "no positive test"
+    cat[has & (bac ^ fung)] = "one pathogen +"
+    cat[has & bac & fung] = "bac+ and fung+"
+    cat[(t["bac_cult_positive"] == 1) & (t["fung_cult_positive"] == 1)] = "both cultures +"
+    return cat
+
+
+def gap_scores(H, d, err, part, fold):
+    """Entropy + head gap: a logistic regression on [entropy, d, |d|] fitted to each fold's calibration
+    images (standardised there) to predict errors; returns a score for every image (NaN if a fold's
+    calibration images have no errors or no correct ones)."""
+    from sklearn.linear_model import LogisticRegression
+    X = np.c_[H, d, np.abs(d)]
+    out = np.full(len(H), np.nan)
+    for f in np.unique(fold):
+        m, c = fold == f, (fold == f) & (part == 0)
+        if err[c].all() or not err[c].any():
+            continue
+        mu, sd = X[c].mean(0), X[c].std(0) + 1e-9
+        lr = LogisticRegression(C=1.0, max_iter=1000).fit((X[c] - mu) / sd, err[c])
+        out[m] = lr.decision_function((X[m] - mu) / sd)
+    return out
 
 
 def qhat(scores):
@@ -234,6 +271,9 @@ def main():
     ap.add_argument("--group_col", default="pID")
     ap.add_argument("--reps", type=int, default=1000)
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--exclude_rows_from", nargs="*", default=[],
+                    help="run folders whose test images are left out (e.g. the v2 single-split runs, to "
+                         "test hypotheses on images that played no part in generating them)")
     a = ap.parse_args()
     os.makedirs(a.out, exist_ok=True)
 
@@ -242,6 +282,16 @@ def main():
         return np.random.default_rng([a.seed] + [zlib.crc32(str(x).encode()) for x in name])
 
     data = load_runs(a.runs)
+    if a.exclude_rows_from:
+        drop = np.unique(np.concatenate([np.load(os.path.join(d, "test_predictions.npz"))["csv_row"]
+                                         for d in a.exclude_rows_from]))
+        for key, d in data.items():
+            keep = ~np.isin(d["csv_row"], drop)
+            for k, v in list(d.items()):
+                if isinstance(v, np.ndarray) and len(v) == len(keep):
+                    d[k] = v[keep]
+        print(f"Left out {len(drop):,} images (the test images of {len(a.exclude_rows_from)} run(s)); "
+              f"{len(next(iter(data.values()))['csv_row']):,} remain.")
     keys = sorted(data)
     print("Models loaded:", ", ".join(f"{m} / {l} ({data[(m, l)]['n_folds']} fold(s))" for m, l in keys))
     r = data[keys[0]]
@@ -266,18 +316,22 @@ def main():
         "MADURAI, confident label": mad & has_post & ((post <= 0.1) | (post >= 0.9)),
         "MADURAI, ambiguous label": mad & amb,
     }
-    if a.csv:
+    cat = None
+    if all("test_results" in d for d in data.values()):
+        cat = test_groups(r["test_results"].astype(float))
+    elif a.csv:
         from copositive_check import participant_groups
         from labels import load_labelled
         df = load_labelled(a.csv, img_root=None, group_col=a.group_col, verbose=False)
         cat_p = participant_groups(df, a.group_col)
         by_row = pd.Series(df[a.group_col].map(cat_p).to_numpy(), index=df["csv_row"].to_numpy())
         cat = by_row.reindex(r["csv_row"]).to_numpy()
+    if cat is not None:
         strata["MADURAI, one pathogen +"] = mad & (cat == "one pathogen +")
         strata["MADURAI, no positive test"] = mad & (cat == "no positive test")
         strata["MADURAI, co-positive"] = mad & np.isin(cat, ["bac+ and fung+", "both cultures +"])
     else:
-        print("No --csv: skipping the test-result strata (one pathogen +, no positive test, co-positive).")
+        print("No test results in the runs and no --csv: skipping the test-result strata.")
     design = {k: {"images": int(m.sum()), "participants": int(len(np.unique(grp[m]))),
                   "eval_images": int((m & (part == 1)).sum())} for k, m in strata.items()}
     print("\nStrata:")
@@ -518,6 +572,113 @@ def main():
     h4.to_csv(os.path.join(a.out, "h4_signals.csv"), index=False)
     h4c.to_csv(os.path.join(a.out, "h4_combined_filter.csv"), index=False)
 
+    # ---- H5: the gap between the two outputs, d = p_bac + p_fung - 1 (exploratory) ------------
+    # d > 0 leans "both", d < 0 leans "neither". Labels never contain either, so whatever d carries
+    # is a by-product. Directions written down from the v2 single split (23 Oct): errors have d < 0
+    # (BD), negative-test patients d < 0 and co-positive d > 0 relative to one pathogen +, 12-month
+    # photos d < 0 relative to enrolment photos of the same studies. Confirm with --exclude_rows_from.
+    visit = r["visit"].astype(str) if "visit" in r else None
+    for key in keys:
+        ph = data[key]["p_hat"].astype(float)
+        M[key]["d"] = ph[:, 0] + ph[:, 1] - 1
+        M[key]["gap_score"] = gap_scores(M[key]["H"], M[key]["d"], ~M[key]["ok"], part, fold)
+    rows = []
+    for key in keys:
+        dk, H, err, gs = M[key]["d"], M[key]["H"], ~M[key]["ok"], M[key]["gap_score"]
+        for s_name, bt in boots.items():
+            i = bt.idx
+            ie = i[evalm[i] & np.isfinite(gs[i])]
+            row = {"model": key[0], "labels": key[1], "stratum": s_name, "images": len(i),
+                   "mean d": dk[i].mean(), "share d < -0.1": np.mean(dk[i] < -0.1),
+                   "share d > 0.1": np.mean(dk[i] > 0.1), "Spearman(d, entropy)": spearman(dk[i], H[i]),
+                   "error detection, -d": auroc(err[i], -dk[i]), "error detection, |d|": auroc(err[i], np.abs(dk[i]))}
+            if len(ie) >= 10 and err[ie].any() and (~err[ie]).any():
+                row["eval: error detection, entropy"] = auroc(err[ie], H[ie])
+                row["eval: error detection, entropy + gap"] = auroc(err[ie], gs[ie])
+
+                def gain(b, key=key):
+                    be = b[evalm[b] & np.isfinite(M[key]["gap_score"][b])]
+                    e = ~M[key]["ok"][be]
+                    return auroc(e, M[key]["gap_score"][be]) - auroc(e, M[key]["H"][be])
+                lo, hi, _ = bt.ci(gain)
+                row["gain"] = row["eval: error detection, entropy + gap"] - row["eval: error detection, entropy"]
+                row["gain ci_low"], row["gain ci_high"], row["gain verdict"] = lo, hi, verdict(lo, hi, +1)
+            rows.append(row)
+    h5 = pd.DataFrame(rows)
+    h5.to_csv(os.path.join(a.out, "h5_gap.csv"), index=False)
+
+    gap_groups = {}
+    if cat is not None:
+        gap_groups["MADURAI, co-positive"] = (strata["MADURAI, co-positive"], strata["MADURAI, one pathogen +"], +1)
+        gap_groups["MADURAI, no positive test"] = (strata["MADURAI, no positive test"],
+                                                   strata["MADURAI, one pathogen +"], -1)
+    if visit is not None:
+        twelve = visit == "12 months"
+        same_studies = np.isin(study, np.unique(study[twelve]))
+        enrol = np.char.startswith(visit.astype(str), "enrollment")
+        if twelve.any():
+            gap_groups["12-month photos"] = (twelve, same_studies & enrol, -1)
+    ref_name = {"MADURAI, co-positive": "MADURAI, one pathogen +", "MADURAI, no positive test": "MADURAI, one pathogen +",
+                "12-month photos": "enrolment photos, same studies"}
+    rows = []
+    for g_name, (ma, mb, direction) in gap_groups.items():
+        if not ma.any() or not mb.any():
+            continue
+        bt = Boot(grp, np.where(ma | mb)[0], a.reps, rng_for("gap", g_name))
+        for key in keys:
+            dk = M[key]["d"]
+
+            def diff(b, dk=dk):
+                ia, ib = b[ma[b]], b[mb[b]]
+                return dk[ia].mean() - dk[ib].mean() if len(ia) and len(ib) else np.nan
+            lo, hi, pv = bt.ci(diff)
+            rows.append({"group": g_name, "compared with": ref_name[g_name], "expected sign": "+" if direction > 0 else "-",
+                         "model": key[0], "labels": key[1], "images": int(ma.sum()),
+                         "participants": int(len(np.unique(grp[ma]))), "mean d": dk[ma].mean(),
+                         "mean d, comparison": dk[mb].mean(), "difference": dk[ma].mean() - dk[mb].mean(),
+                         "ci_low": lo, "ci_high": hi, "p_boot": pv, "verdict": verdict(lo, hi, direction)})
+    h5g = pd.DataFrame(rows)
+    h5g.to_csv(os.path.join(a.out, "h5_gap_groups.csv"), index=False)
+
+    # ---- H6: the two outputs as a joint, against the raw test pairs (MADURAI) ------------------
+    # Product rule P(both) = b f etc. If the two outputs are calibrated for their own test and the
+    # tests are independent given the image, the observed both-positive share equals mean(b f).
+    # Meaningful mainly for the test-supervised baselines (smear, culture); shown for every model.
+    rows = []
+    if all("test_results" in d for d in data.values()):
+        trs = r["test_results"].astype(float)
+        for pair_name, (tb, tf) in TEST_PAIRS.items():
+            xb, xf = trs[:, TESTS.index(tb)], trs[:, TESTS.index(tf)]
+            m = mad & ~np.isnan(xb) & ~np.isnan(xf)
+            if m.sum() < 10:
+                continue
+            i = np.where(m)[0]
+            obs = np.c_[xb * xf, xb * (1 - xf), (1 - xb) * xf, (1 - xb) * (1 - xf)][i]
+            bt = Boot(grp, i, a.reps, rng_for("joint", pair_name))
+            for key in keys:
+                ph = data[key]["p_hat"].astype(float)
+                b_, f_ = ph[:, 0], ph[:, 1]
+                pred = np.c_[b_ * f_, b_ * (1 - f_), (1 - b_) * f_, (1 - b_) * (1 - f_)]
+
+                def excess(bb):  # observed minus product-rule expected both-positive share
+                    return np.mean(xb[bb] * xf[bb]) - np.mean(b_[bb] * f_[bb])
+                lo, hi, _ = bt.ci(excess)
+                rows.append({"tests": pair_name, "model": key[0], "labels": key[1], "images": len(i),
+                             "participants": int(len(np.unique(grp[i]))),
+                             "observed both +": obs[:, 0].mean(), "product rule P(both)": pred[i, 0].mean(),
+                             "observed - expected, both +": obs[:, 0].mean() - pred[i, 0].mean(),
+                             "ci_low": lo, "ci_high": hi,
+                             "observed neither +": obs[:, 3].mean(), "product rule P(neither)": pred[i, 3].mean(),
+                             "observed bacterial + (marginal)": xb[i].mean(), "mean p_bac": b_[i].mean(),
+                             "observed fungal + (marginal)": xf[i].mean(), "mean p_fung": f_[i].mean(),
+                             "AUROC P(both) for both +": auroc(obs[:, 0] == 1, pred[i, 0]),
+                             "AUROC P(neither) for neither +": auroc(obs[:, 3] == 1, pred[i, 3]),
+                             "Spearman(p_bac, p_fung)": spearman(b_[i], f_[i]),
+                             "4-pattern Brier, product rule": np.mean(((pred[i] - obs) ** 2).sum(1))})
+    h6 = pd.DataFrame(rows)
+    if len(h6):
+        h6.to_csv(os.path.join(a.out, "h6_joint.csv"), index=False)
+
     # ---- per fold (training variation) -----------------------------------------
     rows = []
     for key in keys:
@@ -529,9 +690,35 @@ def main():
     per_fold = pd.DataFrame(rows)
     per_fold.to_csv(os.path.join(a.out, "per_fold.csv"), index=False)
 
+    # soft - hard, fold by fold (reading rule: same sign as pooled in at least 4 of 5 folds)
+    FOLD_METRICS = [("AUROC", lambda p, i: auroc(y[i], p[i])),
+                    ("Brier", lambda p, i: np.mean((p[i] - y[i]) ** 2)),
+                    ("ECE", lambda p, i: ece(p[i], y[i])),
+                    ("Brier against the posterior",
+                     lambda p, i: np.mean(((p[i] - post[i]) ** 2)[has_post[i]]) if has_post[i].any() else np.nan),
+                    ("mean p(bacterial)", lambda p, i: p[i].mean())]
+    rows = []
+    for model in pairs:
+        ps, ph_ = M[(model, "soft")]["p"], M[(model, "hard")]["p"]
+        for s_name in ("All", "MADURAI"):
+            sm = strata[s_name]
+            for name, fn in FOLD_METRICS:
+                pooled = fn(ps, np.where(sm)[0]) - fn(ph_, np.where(sm)[0])
+                per = [fn(ps, np.where(sm & (fold == f))[0]) - fn(ph_, np.where(sm & (fold == f))[0])
+                       for f in np.unique(fold)]
+                per = np.array(per, float)
+                ok_f = np.isfinite(per)
+                rows.append({"model": model, "stratum": s_name, "metric": name, "pooled soft - hard": pooled,
+                             **{f"fold {int(f)}": v for f, v in zip(np.unique(fold), per)},
+                             "folds with the pooled sign": f"{int(np.sum(np.sign(per[ok_f]) == np.sign(pooled)))} "
+                                                           f"of {int(ok_f.sum())}"})
+    fold_signs = pd.DataFrame(rows)
+    fold_signs.to_csv(os.path.join(a.out, "soft_minus_hard_by_fold.csv"), index=False)
+
     with open(os.path.join(a.out, "design.json"), "w") as f:
         json.dump({"strata": design, "models": [f"{m} / {l}" for m, l in keys], "reps": a.reps,
-                   "alpha": ALPHA, "csv_strata": bool(a.csv)}, f, indent=2)
+                   "alpha": ALPHA, "test_strata": cat is not None,
+                   "left_out_images_from": a.exclude_rows_from}, f, indent=2)
 
     # ---- report ------------------------------------------------------------------
     def md(df, cols=None):
@@ -542,8 +729,12 @@ def main():
             return "```\n" + d.to_string(index=False, float_format=lambda v: f"{v:.3f}") + "\n```"
 
     with open(os.path.join(a.out, "report.md"), "w") as f:
-        f.write("# Full analysis (H1-H4 x strata)\n\nSee ANALYSIS_PLAN.md for definitions. "
-                f"Bootstrap over participants, {a.reps} resamples.\n\n")
+        f.write("# Full analysis (H1-H6 x strata)\n\nSee ANALYSIS_PLAN.md for definitions. "
+                f"Bootstrap over participants, {a.reps} resamples. "
+                + ", ".join(f"{m} / {l}: {data[(m, l)]['n_folds']} fold(s)" for m, l in keys) + ".\n\n"
+                + (f"Left out: the test images of {len(a.exclude_rows_from)} run(s) "
+                   f"({', '.join(os.path.basename(os.path.normpath(x)) for x in a.exclude_rows_from)}).\n\n"
+                   if a.exclude_rows_from else ""))
         f.write("## Strata\n\n" + md(pd.DataFrame(design).T.reset_index().rename(columns={"index": "stratum"})) + "\n\n")
         for x, z in same:
             f.write(f"Note: '{x}' and '{z}' contain exactly the same images.\n\n")
@@ -562,7 +753,20 @@ def main():
                 + md(h3p) + "\n\n")
         f.write("## H4. How the signals relate (BD models)\n\n" + md(h4) + "\n\n### Combined filter\n\n"
                 + md(h4c) + "\n\n")
-        f.write("## Per fold\n\n" + md(per_fold) + "\n")
+        f.write("## H5. Gap between the two outputs, d = p_bac + p_fung - 1 (exploratory)\n\n"
+                "d > 0 leans 'both', d < 0 'neither'. 'Entropy + gap' is a logistic regression on entropy, d and "
+                "|d| fitted on each fold's calibration images; gain = its error-detection AUROC minus entropy's "
+                "on evaluation images.\n\n" + md(h5) + "\n\n")
+        if len(h5g):
+            f.write("### Groups\n\n" + md(h5g) + "\n\n")
+        if len(h6):
+            f.write("## H6. The two outputs as a joint, against raw test pairs (MADURAI)\n\n"
+                    "Product rule: P(both) = p_bac x p_fung. If each output is calibrated for its own test and "
+                    "the tests are independent given the image, observed both + equals the product rule's mean. "
+                    "Meaningful mainly for the smear- and culture-supervised baselines.\n\n" + md(h6) + "\n\n")
+        f.write("## Per fold\n\n" + md(per_fold) + "\n\n")
+        if len(fold_signs):
+            f.write("### Soft minus hard, fold by fold\n\n" + md(fold_signs) + "\n")
 
     pd.set_option("display.width", 250)
     pd.set_option("display.max_rows", 400)
