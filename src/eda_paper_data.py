@@ -150,7 +150,8 @@ def load_paper(path, split, notes):
     idx = found.map(lambda x: x[1])
     df["study"] = df["study_full"].map(short_study)
     df["subfolder"] = [pp[i + 1].strip() if 0 <= i and i + 1 < len(pp) - 1 else "" for pp, i in zip(df["_parts"], idx)]
-    df["relpath"] = ["/".join(pp[i:]).strip().lower() if i >= 0 else "" for pp, i in zip(df["_parts"], idx)]
+    df["relpath_orig"] = ["/".join(p.strip() for p in pp[i:]) if i >= 0 else "" for pp, i in zip(df["_parts"], idx)]
+    df["relpath"] = df["relpath_orig"].str.lower()
     df["visit"] = [parse_visit(s, n) if s in STUDY_SHORT else "not encoded"
                    for s, n in zip(df["study_full"], df["basename"])]
     df["is_followup"] = df["visit"].isin(FOLLOWUP_VISITS)
@@ -538,9 +539,30 @@ def main():
                 "Travis's hard labels vs our LCA bins:\n\n" + md(pd.DataFrame(brow)),
                 "Our images in and out of the paper set, by study and visit:\n\n" + md(save(left, "old_in_paper_set.csv"), ".0f"))
         answers_old = (matched, filled_by_study)
+        d["_our_path"] = np.where(matched, o["file_path"].astype(str).str.replace(PACS_PREFIX, a.img_root, regex=False), "")
     else:
         section("8. Against our CSV", f"Skipped (no old CSV at {a.old_csv}).")
         answers_old = None
+        d["_our_path"] = ""
+
+    # ---- 9. Image files for every paper image -----------------------------------------------------------
+    # via our CSV (matched rows), else the paper's own relative path under --img_root (the Drive layout
+    # mirrors the image store for the matched images)
+    d["_by_rel"] = (a.img_root.rstrip("/") + "/" + d["relpath_orig"]).where(d["relpath_orig"] != "", "")
+    d["_found_csv"] = d["_our_path"].map(lambda x: bool(x) and os.path.exists(x))
+    d["_found_rel"] = d["_by_rel"].map(lambda x: bool(x) and os.path.exists(x))
+    d["_found"] = d["_found_csv"] | d["_found_rel"]
+    files_tab = (d.groupby(["study", "split"]).agg(images=("subject", "size"), via_our_csv=("_found_csv", "sum"),
+                                                     via_relative_path=("_found_rel", "sum"), found=("_found", "sum"))
+                 .reset_index())
+    files_tab["missing"] = files_tab["images"] - files_tab["found"]
+    section("9. Image files on disk for the paper's images",
+            f"Looked up through our CSV (matched images) and as `{a.img_root}/<study folder>/<subfolder>/<file>` "
+            "(the paper's relative path).\n\n" + md(save(files_tab, "image_files.csv"), ".0f"))
+    files_answer = (f"**Image files.** Found on disk for {int(d._found.sum()):,} of {len(d):,} paper images "
+                   f"(train {int(d[d.split == 'train']._found.sum()):,} of {int((d.split == 'train').sum()):,}, test "
+                   f"{int(d[d.split == 'test']._found.sum()):,} of {int((d.split == 'test').sum()):,}); missing by study: "
+                   + (", ".join(f"{k} {v}" for k, v in d[~d._found].study.value_counts().items()) or "none") + ".")
 
     # ---- Answers ----------------------------------------------------------------------------------------
     answers.append(f"**Images and participants.** {len(d):,} images, {d.subject.nunique():,} subjects "
@@ -578,6 +600,7 @@ def main():
     if answers_old is not None:
         matched, _ = answers_old
         answers.append(f"**Against our CSV.** {int(matched.sum()):,} of {len(d):,} paper images matched to our rows.")
+    answers.append(files_answer)
 
     with open(os.path.join(a.out, "eda_report.md"), "w") as f:
         f.write("# EDA of the paper's data (training images.csv, test images.csv)\n\n"
