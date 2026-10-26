@@ -27,6 +27,7 @@ Prints and writes aggregates only: no subject IDs, paths or image names.
 
 import argparse
 import os
+import re
 import sys
 
 import numpy as np
@@ -82,18 +83,35 @@ def pattern(row):
     return " ".join(f"{TEST_SHORT[t]}{'.' if np.isnan(row[t]) else ('+' if row[t] == 1 else '-')}" for t in TESTS)
 
 
+SITES = ["madurai", "coimbatore", "pondicherry", "tirunelveli", "lumbini", "bharatpur", "bharaptur",
+         "dartmouth", "proctor"]
+
+
 def find_study(parts):
-    names = {k.lower(): k for k in STUDY_SHORT}
-    names.update({v.lower(): k for k, v in STUDY_SHORT.items()})
-    for p in parts[:-1][::-1]:
-        k = p.strip().lower()
-        if k in names:
-            return names[k]
-    joined = "/".join(parts).lower()
-    for short, full in sorted(((v.lower(), k) for k, v in STUDY_SHORT.items()), key=lambda x: -len(x[0])):
-        if short in joined:
-            return full
-    return "unknown"
+    """(study folder, its index): the shallowest folder that is a known study folder, else the shallowest
+    ending in 'photos' / 'pictures'. Shallowest first, because trial folders have site subfolders
+    (e.g. MUTT1-Pictures/Madurai/...) that must not be read as the MADURAI study."""
+    known = {k.lower(): k for k in STUDY_SHORT}
+    for i, p in enumerate(parts[:-1]):
+        if p.strip().lower() in known:
+            return known[p.strip().lower()], i
+    for i, p in enumerate(parts[:-1]):
+        if re.search(r"[ _-](photos|pictures)$", p.strip().lower()):
+            return p.strip(), i
+    return "unknown", -1
+
+
+def short_study(full):
+    return STUDY_SHORT.get(full, re.sub(r"[ _-](photos|pictures)$", "", full, flags=re.I))
+
+
+def name_shape(name):
+    """File-name format with digit runs replaced by '#' (no identifiers)."""
+    return re.sub(r"\d+", "#", str(name))
+
+
+def norm_name(name):
+    return re.sub(r"[^a-z0-9]", "", os.path.splitext(str(name).lower())[0])
 
 
 def load_paper(path, split, notes):
@@ -127,9 +145,14 @@ def load_paper(path, split, notes):
     p = df["Drive_image_path"].astype(str).str.replace("\\", "/", regex=False)
     df["_parts"] = p.str.split("/")
     df["basename"] = df["_parts"].map(lambda x: x[-1].strip())
-    df["study_full"] = df["_parts"].map(find_study)
-    df["study"] = df["study_full"].map(lambda s: STUDY_SHORT.get(s, s))
-    df["visit"] = [parse_visit(s, n) if s != "unknown" else "unknown" for s, n in zip(df["study_full"], df["basename"])]
+    found = df["_parts"].map(find_study)
+    df["study_full"] = found.map(lambda x: x[0])
+    idx = found.map(lambda x: x[1])
+    df["study"] = df["study_full"].map(short_study)
+    df["subfolder"] = [pp[i + 1].strip() if 0 <= i and i + 1 < len(pp) - 1 else "" for pp, i in zip(df["_parts"], idx)]
+    df["relpath"] = ["/".join(pp[i:]).strip().lower() if i >= 0 else "" for pp, i in zip(df["_parts"], idx)]
+    df["visit"] = [parse_visit(s, n) if s in STUDY_SHORT else "not encoded"
+                   for s, n in zip(df["study_full"], df["basename"])]
     df["is_followup"] = df["visit"].isin(FOLLOWUP_VISITS)
     df["subject"] = df["subject"].astype(str).str.strip()
     return df, rawvals
@@ -203,7 +226,17 @@ def main():
     if dup_path:
         notes.append(f"{dup_path} duplicated image paths (within train {dup_within['train']}, within test "
                      f"{dup_within['test']}, across splits {cross_path})")
+    sub_rows = []
+    for stdy, g in d.groupby("study"):
+        sf = g["subfolder"]
+        site = sf.str.lower().isin(SITES)
+        sub_rows.append({"study": stdy, "images": len(g), "in a subfolder": int((sf != "").sum()),
+                         "distinct subfolders": int(sf[sf != ""].nunique()),
+                         "site-named subfolders": ", ".join(f"{k} {v}" for k, v in sf[site].value_counts().items()),
+                         "other subfolders (not shown)": int(sf[(sf != "") & ~site].nunique())})
     section("1. Paths, studies and visits", "\n".join(f"- {x}" for x in lines),
+            "Study = the study folder (shallowest folder named after a study); subfolders below it:\n\n"
+            + md(save(pd.DataFrame(sub_rows), "subfolders_by_study.csv"), ".0f"),
             md(save(st, "studies_by_split.csv")), "Visits (parsed from image names):\n\n" + md(save(vis, "visits_by_study.csv")),
             f"Duplicated paths: {dup_path} (within train {dup_within['train']}, within test {dup_within['test']}, "
             f"same path in both splits {cross_path}); same file name in both splits: {cross_base}.")
@@ -286,14 +319,35 @@ def main():
                                     naive_two_class_all4=("naive_bac_all4", "first"),
                                     naive_two_class_own_tests=("naive_bac_own", "first"))
            .reset_index().sort_values("images", ascending=False))
+    def own_table(col, own, prob_of):
+        sub = d.assign(_p=d[own].apply(lambda r: " ".join(
+            f"{TEST_SHORT[t]}{'.' if np.isnan(r[t]) else ('+' if r[t] == 1 else '-')}" for t in own), axis=1))
+        sub["_naive"] = sub.apply(lambda r: naive_bac(r, own), axis=1)
+        if prob_of == "fung":
+            sub["_naive"] = 1 - sub["_naive"]
+        t = (sub.groupby("_p").agg(images=("subject", "size"), subjects=("subject", "nunique"),
+                                   studies=("study", lambda x: ", ".join(sorted(set(x)))),
+                                   distinct_values=(col, "nunique"), paper=(col, "mean"),
+                                   recomputed=("_naive", "first")).reset_index()
+             .rename(columns={"_p": "own tests", "paper": f"paper {col}",
+                              "recomputed": "supplement LCA, own tests only"}))
+        t["difference"] = t[f"paper {col}"] - t["supplement LCA, own tests only"]
+        return t.sort_values("images", ascending=False)
+    own_b = own_table("bac_post_prob", ["bac_smear", "bac_cult_positive"], "bac")
+    own_f = own_table("fung_post_prob", ["fung_smear", "fung_cult_positive"], "fung")
+    max_own_diff = float(np.nanmax(np.abs(np.r_[own_b["difference"], own_f["difference"]])))
     section("4. Posteriors",
             md(save(sum_tab, "posterior_sums.csv")),
             "Images without both posteriors, by study:\n\n" + md(nop),
             "Distribution:\n\n" + md(save(hist, "posterior_hist.csv"), ".0f"),
             "By study (ambiguous = between 0.1 and 0.9):\n\n" + md(save(by_study_post, "posteriors_by_study.csv")),
             "**Two-class or per pathogen?** If a posterior depends only on its own pathogen's tests, the spread "
-            "within groups of the same own-test pattern is about 0; if it depends on all four, only the "
-            "all-four grouping is about 0.\n\n" + md(save(diag, "posterior_dependence.csv"), ".4f"),
+            "within groups of the same own-test pattern is 0 (and so is the all-four spread); if it depends on "
+            "all four tests, only the all-four spread is 0.\n\n" + md(save(diag, "posterior_dependence.csv"), ".4f"),
+            "**Each posterior by its own tests**, against the supplement's two-class LCA (44% bacterial; "
+            "Gram 40/97, BA 37/96, KOH 94/94, PDA 72/98 sensitivity/specificity) applied to those two tests "
+            f"only. Largest difference: {max_own_diff:.3f}.\n\n"
+            + md(save(own_b, "bac_posterior_by_own_tests.csv")) + "\n\n" + md(save(own_f, "fung_posterior_by_own_tests.csv")),
             "**By test pattern** (`+` positive, `-` negative, `.` missing; Gram KOH BA PDA). Naive columns: "
             "P(bacterial) recomputed from the supplement's estimates assuming tests independent given the "
             "class, from all four tests or from the two bacterial tests only.\n\n" + md(save(pat, "posterior_by_pattern.csv")))
@@ -357,34 +411,58 @@ def main():
             if "file_path" in old else old["image_name"].astype(str)
         if "image_name" in old:
             old["basename"] = old["basename"].where(old["file_path"].notna(), old["image_name"].astype(str))
+        old["study_s"] = old["study"].astype(str).map(short_study)
+        old["relpath"] = old["file_path"].astype(str).str.replace(PACS_PREFIX + "/", "", regex=False).str.strip().str.lower() \
+            if "file_path" in old else ""
+        old["k2"] = old["study"].astype(str).str.lower() + "|" + old["basename"].str.lower()
         old["k1"] = old["basename"].str.lower()
-        old["k2"] = old["study"].astype(str).str.lower() + "|" + old["k1"]
+        old["k0s"] = old["study"].astype(str).str.lower() + "|" + old["basename"].map(norm_name)
+        old["k0"] = old["basename"].map(norm_name)
+        d["k2"] = d["study_full"].str.lower() + "|" + d["basename"].str.lower()
         d["k1"] = d["basename"].str.lower()
-        d["k2"] = d["study_full"].str.lower() + "|" + d["k1"]
-        uniq_old2 = not old["k2"].duplicated().any()
-        m2 = old.drop_duplicates("k2").set_index("k2")
-        m1 = old[~old["k1"].duplicated(keep=False)].set_index("k1")
-        idx = []
-        for k2, k1 in zip(d["k2"], d["k1"]):
-            if k2 in m2.index:
-                idx.append(("k2", k2))
-            elif k1 in m1.index:
-                idx.append(("k1", k1))
+        d["k0s"] = d["study_full"].str.lower() + "|" + d["basename"].map(norm_name)
+        d["k0"] = d["basename"].map(norm_name)
+        methods = [("relative path", "relpath"), ("study + file name", "k2"), ("file name", "k1"),
+                   ("study + normalised name", "k0s"), ("normalised name", "k0")]
+        maps = {}
+        for _, k in methods:  # only keys that identify one row of our CSV
+            vc = old[k].value_counts()
+            ok = old[old[k].isin(vc[vc == 1].index) & (old[k] != "")]
+            maps[k] = dict(zip(ok[k], ok.index))
+        hit, how_l = [], []
+        for _, r in d.iterrows():
+            for label, k in methods:
+                if r[k] in maps[k]:
+                    hit.append(maps[k][r[k]])
+                    how_l.append(label)
+                    break
             else:
-                idx.append((None, None))
-        how = pd.Series([h for h, _ in idx])
-        o = pd.DataFrame([m2.loc[k].to_dict() if h == "k2" else (m1.loc[k].to_dict() if h == "k1" else {})
-                          for h, k in idx])
+                hit.append(None)
+                how_l.append(None)
+        how = pd.Series(how_l)
         matched = how.notna().to_numpy()
-        lines = [f"Our CSV: {len(old):,} rows. Paper images matched: {int(matched.sum()):,} of {len(d):,} "
-                 f"({matched.mean():.1%}); by study + file name {int((how == 'k2').sum()):,}, by file name only "
-                 f"{int((how == 'k1').sum()):,}. Study + file name unique in our CSV: {uniq_old2}."]
+        o = old.reindex([h if h is not None else -1 for h in hit]).reset_index(drop=True)
+        n_dupe = int(pd.Series([h for h in hit if h is not None]).duplicated().sum())
+        lines = [f"Our CSV: {len(old):,} rows. Paper images matched to a row of ours: {int(matched.sum()):,} of "
+                 f"{len(d):,} ({matched.mean():.1%}). By method: "
+                 + ", ".join(f"{lab} {int((how == lab).sum()):,}" for lab, _ in methods)
+                 + f". Rows of ours matched by more than one paper image: {n_dupe}."]
         if (~matched).any():
             lines.append("Unmatched paper images by study: " + ", ".join(
                 f"{s} {n}" for s, n in d[~matched].study.value_counts().items()))
+        # file-name formats where matching failed (digit runs replaced by #; formats with >= 5 images)
+        old_hit = set(h for h in hit if h is not None)
+        shape_rows = []
+        for stdy in sorted(d[~matched].study.unique()):
+            pu = d[~matched & (d.study == stdy)]["basename"].map(name_shape).value_counts()
+            ou = old[(old.study_s == stdy) & ~old.index.isin(old_hit)]["basename"].map(name_shape).value_counts()
+            shape_rows.append({"study": stdy, "unmatched paper images": int(pu.sum()),
+                               "their name formats": "; ".join(f"{k} ({v})" for k, v in pu[pu >= 5].head(4).items()),
+                               "our unmatched rows, same study": int(ou.sum()),
+                               "our name formats": "; ".join(f"{k} ({v})" for k, v in ou[ou >= 5].head(4).items())})
         # studies agree?
         if matched.any():
-            os_ = o.loc[matched, "study"].map(lambda s: STUDY_SHORT.get(s, s)).to_numpy()
+            os_ = o.loc[matched, "study_s"].to_numpy()
             lines.append(f"Study agrees for {np.mean(os_ == d.loc[matched, 'study'].to_numpy()):.1%} of matched images.")
         # tests
         trows = []
@@ -425,8 +503,7 @@ def main():
                 brow.append({"label": h, "our bin present": int(ok.sum()),
                              "Travis hard = our bin": float(np.mean(d.loc[matched, h].to_numpy()[ok] == ob[ok])) if ok.any() else np.nan})
         # what the paper left out of our CSV
-        old_m = old["k2"].isin(set(d["k2"])) | old["k1"].isin(set(d["k1"]))
-        old["study_s"] = old["study"].map(lambda s: STUDY_SHORT.get(s, s))
+        old_m = pd.Series(old.index.isin(old_hit), index=old.index)
         old["visit"] = [parse_visit(s, n) if s in STUDY_SHORT else "unknown"
                         for s, n in zip(old["study"].astype(str), old["basename"])]
         left = pd.crosstab([old.study_s, old.visit], old_m.map({True: "in paper set", False: "not in paper set"})).reset_index()
@@ -453,6 +530,8 @@ def main():
             ex = lp.map(os.path.exists)
             exist_line = f"Image files found on disk for matched images: {int(ex.sum()):,} of {int(matched.sum()):,}."
         section("8. Against our CSV", "\n".join(f"- {x}" for x in lines + sub_lines + ([exist_line] if exist_line else [])),
+                "File-name formats where matching failed (digit runs shown as #; formats with at least 5 images):\n\n"
+                + md(save(pd.DataFrame(shape_rows), "unmatched_name_formats.csv"), ".0f"),
                 "Tests, paper vs ours (matched images):\n\n" + md(save(pd.DataFrame(trows), "old_vs_paper_tests.csv")),
                 "Images with any test recorded, by study (matched):\n\n" + md(save(filled_by_study, "old_vs_paper_tests_by_study.csv"), ".0f"),
                 "Posteriors, paper vs ours:\n\n" + md(save(pd.DataFrame(prow), "old_vs_paper_posteriors.csv")),
@@ -466,7 +545,11 @@ def main():
     # ---- Answers ----------------------------------------------------------------------------------------
     answers.append(f"**Images and participants.** {len(d):,} images, {d.subject.nunique():,} subjects "
                    f"(paper: {PAPER_IMAGES:,} / {PAPER_PARTICIPANTS:,}); train {len(tr):,} / test {len(te):,} images. "
-                   f"Follow-up photos: {int(d.is_followup.sum()):,}.")
+                   f"Follow-up photos: {int(d.is_followup.sum()):,}. Studies: "
+                   + ", ".join(f"{k} {v:,}" for k, v in d.study.value_counts().items()) + ".")
+    answers.append(f"**A missing validation set?** These files hold {len(d) / PAPER_IMAGES:.1%} of the paper's images and "
+                   f"{d.subject.nunique() / PAPER_PARTICIPANTS:.1%} of its participants; train is {len(tr) / PAPER_IMAGES:.1%} "
+                   f"and test {len(te) / PAPER_IMAGES:.1%} of the paper's images (the paper split 70/15/15).")
     answers.append(f"**Split grouped by participant?** Subjects in both train and test: {len(both)}.")
     mutt = d[d.study.isin(["MUTT1", "MUTT2", "MUTT Pilot"])]
     scut = d[d.study == "SCUT"]
@@ -477,14 +560,18 @@ def main():
                        f"of {len(scut):,}.")
     if hp.any():
         answers.append(f"**Two-class or per pathogen?** {float((dev <= 1e-3).mean()):.1%} of posterior pairs sum to 1 "
-                       f"(within 0.001). Within-pattern SD of bac_post_prob: own tests {diag.iloc[0, 1]:.4f}, all four "
-                       f"{diag.iloc[0, 3]:.4f}.")
+                       f"(within 0.001). Within-pattern SD given the pathogen's own two tests: bacterial "
+                       f"{diag.iloc[0, 1]:.4f}, fungal {diag.iloc[1, 1]:.4f}. Supplement LCA applied to each pathogen's own "
+                       f"tests reproduces the posteriors to within {max_own_diff:.3f}.")
     allneg = pat[pat.pattern == "Gram- KOH- BA- PDA-"]
     if len(allneg):
         r = allneg.iloc[0]
         answers.append(f"**All four tests negative.** {int(r.images)} images / {int(r.subjects)} subjects; paper "
                        f"bac_post_prob {r.bac_post_mean:.3f} (range {r.bac_post_min:.3f}-{r.bac_post_max:.3f}); naive "
                        f"two-class {r.naive_two_class_all4:.3f}; our old CSV 0.688.")
+    agree_tab = pd.DataFrame(agree)
+    answers.append("**Hard labels = posterior > 0.5?** " + ", ".join(
+        f"{r['pathogen']} {r['hard = (posterior > 0.5)']:.1%}" for _, r in agree_tab.iterrows()) + ".")
     vc = d.hard_combo.value_counts()
     answers.append("**Travis's hard labels** [bacterial, fungal]: " + ", ".join(f"[{k}] {vc.get(k, 0):,}" for k in ("1,0", "0,1", "1,1", "0,0"))
                    + f"; [0,0] with no test recorded at all: {int((d.no_tests & (d.hard_combo == '0,0')).sum()):,}.")
