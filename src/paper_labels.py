@@ -36,8 +36,8 @@ import numpy as np
 import pandas as pd
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from eda_paper_data import TESTS, load_paper, md, norm_name  # noqa: E402
-from labels import PACS_PREFIX  # noqa: E402
+from eda_paper_data import DEFAULT_OLD_CSV, TESTS, load_paper, md, norm_name, short_study  # noqa: E402
+from labels import FOLLOWUP_VISITS, PACS_PREFIX, parse_visit  # noqa: E402
 
 IMG_EXT = {".jpg", ".jpeg", ".png", ".tif", ".tiff", ".bmp"}
 PRIOR_BAC = 0.44  # prior the paper's posteriors were computed with (back-solved in the EDA)
@@ -92,6 +92,8 @@ def main():
     ap.add_argument("--val_csv", default=None, help="the paper's validation file, if we get it")
     ap.add_argument("--img_roots", nargs="+", default=[PACS_PREFIX])
     ap.add_argument("--prior_bac", type=float, default=PRIOR_BAC)
+    ap.add_argument("--old_csv", default=DEFAULT_OLD_CSV,
+                    help="our study CSV: are the subjects of images without a file in it? ('none' to skip)")
     ap.add_argument("--out", required=True)
     a = ap.parse_args()
     os.makedirs(a.out, exist_ok=True)
@@ -154,6 +156,26 @@ def main():
     combo = combo.reset_index().rename(columns={"row_0": "hard [bac,fung]"})
     combo.columns = ["hard [bac, fung]"] + list(combo.columns[1:])
     usable = d[d.has_image & ~d.no_posterior]
+    # images without a file: are their subjects in our CSV, and with how many photos?
+    subj_tab = pd.DataFrame()
+    if (~d.has_image).any() and a.old_csv.lower() != "none" and os.path.exists(a.old_csv):
+        old = pd.read_csv(a.old_csv)
+        old["subject"] = old["subject"].astype(str).str.strip()
+        old["study_s"] = old["study"].astype(str).map(short_study)
+        nm = old["image_name"] if "image_name" in old else old["file_path"].astype(str).map(os.path.basename)
+        old["visit"] = [parse_visit(st, n) for st, n in zip(old["study"].astype(str), nm.astype(str))]
+        old["enrol"] = ~old["visit"].isin(FOLLOWUP_VISITS)
+        rows = []
+        for stdy, g in d[~d.has_image].groupby("study"):
+            subs = set(g.subject)
+            o = old[old.subject.isin(subs)]
+            paper_all = d[d.subject.isin(subs)]
+            rows.append({"study": stdy, "images without a file": len(g), "their subjects": len(subs),
+                         "subjects in our CSV": int(o.subject.nunique()),
+                         "paper images for these subjects": len(paper_all),
+                         "our CSV images, enrolment": int(o.enrol.sum()),
+                         "our CSV images, follow-up": int((~o.enrol).sum())})
+        subj_tab = pd.DataFrame(rows)
     split_tab = (usable.groupby(["split", "study"]).agg(images=("subject", "size"), subjects=("subject", "nunique"),
                                                          bacterial_binary=("y_bac", "sum")).reset_index())
     lines = [f"Images: {len(d):,} in the paper's files ({', '.join(f'{s} {n:,}' for s, n in d.split.value_counts().items())}); "
@@ -167,6 +189,7 @@ def main():
                 + "## Image files by study and split\n\n" + md(found, ".0f") + "\n\nHow they were found:\n\n" + md(how, ".0f")
                 + "\n\n## Labels by test pattern (Gram KOH BA PDA)\n\n" + md(pat)
                 + "\n\n## Travis's hard labels against the binary two-class label\n\n" + md(combo, ".0f")
+                + ("\n\n## Images without a file: their subjects in our CSV\n\n" + md(subj_tab, ".0f") if len(subj_tab) else "")
                 + "\n\n## Usable images by split (file found, labels defined)\n\n" + md(split_tab, ".0f") + "\n")
     print("\n".join(lines))
     print("Missing files by study and split: " + (", ".join(
