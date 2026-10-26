@@ -35,6 +35,8 @@ from sklearn.model_selection import GroupShuffleSplit
 PACS_PREFIX = "/pacs/OSHU/Corneal_Ulcer_Image_Sets"
 # Smear and culture columns: 1 positive, 0 negative, -1 missing.
 TESTS = ["bac_smear", "fung_smear", "bac_cult_positive", "fung_cult_positive"]
+# Label types read from the redo table (src/paper_labels.py -> paper_labels.csv)
+PAPER_LABEL_TYPES = ["paper_soft", "paper_hard", "twoclass_soft", "twoclass_hard"]
 TEST_TARGETS = {"smear": ["bac_smear", "fung_smear"],                    # Gram, KOH
                 "culture": ["bac_cult_positive", "fung_cult_positive"]}  # blood agar, PDA
 FOLLOWUP_VISITS = {"3 weeks", "3 months", "12 months", "3E (unclear)"}
@@ -179,6 +181,70 @@ def test_results(df, group_col="pID"):
     return per_participant.reindex(df[group_col]).to_numpy(dtype=np.float32)
 
 
+def load_paper_table(path, verbose=True):
+    """
+    The redo label table written by src/paper_labels.py: one row per paper image with its local file,
+    the paper's split, the four tests, the paper's per-pathogen posteriors, Travis's hard labels and the
+    two-class posterior. Keeps images with a file and labels. Adds the columns the training code expects:
+      csv_row        row number in the table (for joining back)
+      y_bac          binary reference = two-class posterior > 0.5
+      soft_bac/fung  two-class posterior and its complement (the 'label posterior' used in the analysis)
+      has_posterior  True
+      is_followup    from the visit column
+    """
+    t = pd.read_csv(path)
+    t["csv_row"] = np.arange(len(t))
+    need = ["split", "subject", "study", "local_path", "has_image", "paper_soft_bac", "paper_soft_fung",
+            "hard_bac", "hard_fung", "twoclass_bac", "y_bac"] + TESTS
+    miss = [c for c in need if c not in t.columns]
+    if miss:
+        raise ValueError(f"{path}: missing columns {miss}")
+    n0 = len(t)
+    t = t[t["has_image"].astype(bool)]
+    t = t[t[["paper_soft_bac", "paper_soft_fung", "twoclass_bac"]].notna().all(axis=1)].copy()
+    t["subject"] = t["subject"].astype(str)
+    t["local_path"] = t["local_path"].astype(str)
+    t["image_name"] = t["local_path"].map(os.path.basename)
+    t["y_bac"] = (t["twoclass_bac"] > 0.5).astype(int)
+    t["soft_bac"] = t["twoclass_bac"].astype(float)
+    t["soft_fung"] = 1.0 - t["soft_bac"]
+    t["has_posterior"] = True
+    t["visit"] = t.get("visit", pd.Series("not encoded", index=t.index)).fillna("not encoded").astype(str)
+    t["is_followup"] = t["visit"].isin(FOLLOWUP_VISITS)
+    for c in TESTS:
+        t[c] = pd.to_numeric(t[c], errors="coerce")
+    if verbose:
+        print(f"Paper label table: {n0:,} rows; {len(t):,} with an image file and labels; "
+              f"{t['subject'].nunique():,} subjects; splits " +
+              ", ".join(f"{k} {v:,}" for k, v in t["split"].value_counts().items()) + ".")
+    return t.reset_index(drop=True)
+
+
+def split_paper(df, seed=42, group_col="subject", val_share=0.0):
+    """
+    The paper's own split (column 'split'): train / test, plus 'val' rows if the table has them.
+    Without them, val_share > 0 carves that share of training subjects off as validation; 0 (default)
+    leaves no validation set: the paper recipe never uses one to choose the model.
+    The test set is split 20/80 into calibration / evaluation, grouped by subject.
+    """
+    split = df["split"].astype(str).to_numpy()
+    groups = df[group_col].to_numpy()
+    tr = np.where(split == "train")[0]
+    va = np.where(split == "val")[0]
+    te = np.where(split == "test")[0]
+    if len(va) == 0 and val_share > 0:
+        tr_rel, va_rel = next(GroupShuffleSplit(1, test_size=val_share, random_state=seed)
+                              .split(tr, groups=groups[tr]))
+        tr, va = tr[tr_rel], tr[va_rel]
+    ca_rel, ev_rel = next(GroupShuffleSplit(1, test_size=0.80, random_state=seed).split(te, groups=groups[te]))
+    parts = {"train": tr, "val": va, "test": te, "cal": te[ca_rel], "eval": te[ev_rel]}
+    for a, b in [("train", "val"), ("train", "test"), ("val", "test"), ("cal", "eval")]:
+        shared = set(groups[parts[a]]) & set(groups[parts[b]])
+        if shared:
+            raise AssertionError(f"{len(shared)} subjects are in both {a} and {b}.")
+    return parts
+
+
 def targets(df, label_type, group_col="pID"):
     """
     Training targets, shape (N, 2): [bacterial, fungal].
@@ -194,6 +260,16 @@ def targets(df, label_type, group_col="pID"):
     if label_type in TEST_TARGETS:
         cols = [TESTS.index(c) for c in TEST_TARGETS[label_type]]
         return test_results(df, group_col)[:, cols]
+    if label_type == "paper_soft":     # the paper's per-pathogen posteriors (need not sum to 1)
+        return df[["paper_soft_bac", "paper_soft_fung"]].to_numpy(dtype=np.float32)
+    if label_type == "paper_hard":     # Travis: smear or culture positive, per pathogen
+        return df[["hard_bac", "hard_fung"]].to_numpy(dtype=np.float32)
+    if label_type == "twoclass_soft":  # P(bacterial | all four tests), complementary
+        p = df["twoclass_bac"].to_numpy(dtype=np.float32)
+        return np.stack([p, 1 - p], 1)
+    if label_type == "twoclass_hard":  # its binary label
+        y = df["y_bac"].to_numpy(dtype=np.float32)
+        return np.stack([y, 1 - y], 1)
     raise ValueError(label_type)
 
 

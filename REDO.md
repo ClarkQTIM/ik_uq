@@ -54,6 +54,41 @@ Send back `results/eda/eda_report.md`: aggregates only, no subject IDs, paths or
 | Where soft and hard targets differ (where soft vs hard can show anything) | 7 |
 | Paper vs our CSV: tests, posteriors, bins, images left out, files on disk | 8 |
 
+## 2. Label table and image files
+
+```bash
+python src/paper_labels.py --train "training images.csv" --test "test images.csv" --out results/labels \
+    --img_roots /pacs/OSHU/Corneal_Ulcer_Image_Sets /persist/QTIM/Active/26-0096/Corneal_Ulcer_Image_Sets
+```
+
+Writes `results/labels/paper_labels.csv` (identifiers; stays here) and `labels_report.md` (send).
+As of 26 Oct: 2,883 of 3,813 images found; 930 trial enrolment photos (MUTT1 547, SCUT 220, MUTT2 163)
+exist only on the paper's Google Drive; asked Travis. When they arrive, put them under an image root
+and rerun this step; nothing else changes.
+
+## 3. Train on the paper's split
+
+```bash
+python src/model.py --labels_csv results/labels/paper_labels.csv --label_type paper_soft --dry_run
+DRY_RUN=1 OUT_ROOT=results/paper_split scripts/launch_redo.sh     # the 10-run plan
+OUT_ROOT=results/paper_split scripts/launch_redo.sh               # go (cuda:0 + cuda:1)
+```
+
+| Setup | Head / labels | Scored |
+|---|---|---|
+| A_paper, C_paper | sigmoid / paper_soft, paper_hard | per pathogen vs Travis's hard labels (the paper's metric), and binary |
+| B_paper, D_paper | BD / paper_soft, paper_hard | same |
+| A_2c, C_2c | sigmoid / twoclass_soft, twoclass_hard | binary vs the two-class label |
+| B_2c, D_2c | BD / twoclass_soft, twoclass_hard | same |
+| SM, CU | sigmoid / smear, culture (BCE) | each output vs its own test |
+
+Paper recipe throughout; trains on the full paper training split (no validation set: the recipe keeps
+the final epoch; `--val_share 0.15` would hold out 15% of training subjects to watch validation loss).
+Test split divided 20/80 into calibration/evaluation for conformal. Each run's `test_metrics.json`
+has `per_pathogen_vs_hard_labels` (all test images, MADURAI, other studies).
+About 5 GPU-hours in all (about 2.5 on two GPUs). If CU runs out of memory (two stages train):
+`EXTRA="--batch 16 --accum 2" SETUPS="CU" OUT_ROOT=results/paper_split scripts/launch_redo.sh`.
+
 ## After the EDA (plan, to settle with the EDA in hand)
 
 1. Labels from the paper's files: soft = the paper's posteriors; hard = Travis's rule; the paper's

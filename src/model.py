@@ -68,9 +68,9 @@ from torchvision.transforms import InterpolationMode
 from tqdm import tqdm
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from labels import (STUDY_SHORT, TEST_TARGETS, TESTS, label_summary,  # noqa: E402
-                    load_labelled, participant_codes, split_by_participant, split_cv,
-                    targets, test_results)
+from labels import (PAPER_LABEL_TYPES, STUDY_SHORT, TEST_TARGETS, TESTS,  # noqa: E402
+                    label_summary, load_labelled, load_paper_table, participant_codes,
+                    split_by_participant, split_cv, split_paper, targets, test_results)
 
 DEFAULT_CSV = ("/persist/QTIM/Active/26-0096/Corneal_Ulcer_Image_Sets/Data/"
                "corneal_ulcer_study_data_7_24_2025_lambda.csv")
@@ -96,8 +96,15 @@ def get_args(argv=None):
     p.add_argument("--csv", default=DEFAULT_CSV)
     p.add_argument("--img_root", default=DEFAULT_IMG_ROOT)
     p.add_argument("--head", default="sigmoid", choices=["sigmoid", "dirichlet", "beta_dirichlet"])
-    p.add_argument("--label_type", default="soft", choices=["soft", "hard"] + list(TEST_TARGETS),
-                   help="soft / hard: LCA labels; smear / culture: test-supervised baselines")
+    p.add_argument("--label_type", default="soft",
+                   choices=["soft", "hard"] + list(TEST_TARGETS) + PAPER_LABEL_TYPES,
+                   help="soft / hard: our CSV's labels; smear / culture: test-supervised baselines; "
+                        "paper_soft / paper_hard / twoclass_soft / twoclass_hard: the redo table (--labels_csv)")
+    p.add_argument("--labels_csv", default=None,
+                   help="redo: paper_labels.csv from src/paper_labels.py (the paper's images, split and labels)")
+    p.add_argument("--val_share", type=float, default=0.0,
+                   help="redo, no validation file: share of training subjects held out to monitor "
+                        "validation loss (default 0: none; the paper recipe never uses it to pick a model)")
     p.add_argument("--recipe", default="paper", choices=list(RECIPES))
     p.add_argument("--epochs", type=int, default=None, help="paper 15; legacy 30 per phase")
     p.add_argument("--batch", type=int, default=None, help="paper 32; legacy 8")
@@ -136,6 +143,13 @@ def get_args(argv=None):
     p.add_argument("--dry_run", action="store_true", help="check labels and images, then exit")
     p.add_argument("--smoke", action="store_true", help="tiny end-to-end run to test the pipeline")
     args = p.parse_args(argv)
+    if args.labels_csv:
+        if args.label_type in ("soft", "hard"):
+            p.error("with --labels_csv use paper_soft, paper_hard, twoclass_soft, twoclass_hard, smear or culture")
+        if args.group_col == "pID":
+            args.group_col = "subject"
+    elif args.label_type in PAPER_LABEL_TYPES:
+        p.error(f"--label_type {args.label_type} needs --labels_csv")
     if args.label_type in TEST_TARGETS:
         if args.head != "sigmoid":
             p.error("--label_type smear / culture needs --head sigmoid (the paper's baselines)")
@@ -621,18 +635,22 @@ def train_paper(model, train_loader, val_loader, args, device, out_dir, keras):
         if epoch == 0 and device.type == "cuda":
             gb = torch.cuda.max_memory_allocated(device) / 1e9
             tqdm.write(f"  Peak GPU memory after epoch 1: {gb:.1f} GB")
-        val = evaluate(model, val_loader, epoch, args.epochs, device)
-        improved = val["val_loss"] < best
-        if improved:
-            best = val["val_loss"]
-            torch.save(model.state_dict(), os.path.join(out_dir, "best_val_model.pt"))
+        if val_loader is not None:
+            val = evaluate(model, val_loader, epoch, args.epochs, device)
+            improved = val["val_loss"] < best
+            if improved:
+                best = val["val_loss"]
+                torch.save(model.state_dict(), os.path.join(out_dir, "best_val_model.pt"))
+        else:  # no validation set: the final-epoch model is the model anyway
+            val, improved = {}, None
         row = {"phase": "paper", "epoch": epoch + 1, "train_loss": tl, **val, "best_so_far": improved}
         if model.head_type != "sigmoid":
             row["kl_weight"] = kl_weight(epoch, args.epochs)
         log_epoch(log_path, row)
-        tqdm.write(f"  epoch {epoch + 1}/{args.epochs}  train {tl:.4f}  val {val['val_loss']:.4f}"
-                   + (f"  evidence {val['mean_evidence']:.3f}  kl_weight {row['kl_weight']:.3g}"
-                      if "mean_evidence" in val else ""))
+        tqdm.write(f"  epoch {epoch + 1}/{args.epochs}  train {tl:.4f}"
+                   + (f"  val {val['val_loss']:.4f}" if "val_loss" in val else "")
+                   + (f"  evidence {val['mean_evidence']:.3f}" if "mean_evidence" in val else "")
+                   + (f"  kl_weight {row['kl_weight']:.3g}" if "kl_weight" in row else ""))
     torch.save(model.state_dict(), os.path.join(out_dir, "model.pt"))
     return model
 
@@ -717,10 +735,18 @@ def main(argv=None):
               + f", form {args.kl_form}\n")
 
     # --- Labels and split -----------------------------------------------------
-    df = load_labelled(args.csv, args.img_root, args.group_col)
+    if args.labels_csv:  # redo: the paper's images, split and labels
+        df = load_paper_table(args.labels_csv)
+    else:
+        df = load_labelled(args.csv, args.img_root, args.group_col)
     if args.n_folds:
         parts = split_cv(df, args.n_folds, args.fold, seed=args.seed, group_col=args.group_col)
         split_desc = f"fold {args.fold} of {args.n_folds}, stratified by study x label"
+    elif args.labels_csv:
+        parts = split_paper(df, seed=args.seed, group_col=args.group_col, val_share=args.val_share)
+        split_desc = "the paper's split" + (" + validation file" if (df["split"] == "val").any() else
+                                            (f" (validation: {args.val_share:.0%} of training subjects)"
+                                             if args.val_share else " (no validation set)"))
     else:
         parts = split_by_participant(df, seed=args.seed, group_col=args.group_col)
         split_desc = "single split"
@@ -827,7 +853,7 @@ def main(argv=None):
                           worker_init_fn=worker_init, generator=g, drop_last=drop_last)
 
     train_loader = loader(tr, train_tf, args.batch, True)
-    val_loader = loader(va, eval_tf, args.batch, False)
+    val_loader = loader(va, eval_tf, args.batch, False) if len(va) else None
 
     # --- Train ------------------------------------------------------------------
     print(f"\nTraining {args.head} / {args.label_type} / {args.recipe} ({config['loss']}): {args.epochs} epochs, "
@@ -842,7 +868,10 @@ def main(argv=None):
     out, p = predict(model, paths[test], eval_tf, args.batch, device, nw)
     score = (p[:, 0] + 1.0 - p[:, 1]) / 2.0  # one bacterial probability from the two outputs
     sub = df.iloc[test]
-    np.savez(os.path.join(out_dir, "test_predictions.npz"),
+    extra = {}
+    if args.labels_csv:  # per-pathogen labels for the paper's own scoring
+        extra = {k: sub[k].to_numpy(dtype=float) for k in ("hard_bac", "hard_fung", "paper_soft_bac", "paper_soft_fung")}
+    np.savez(os.path.join(out_dir, "test_predictions.npz"), **extra,
              head=args.head, label_type=args.label_type, recipe=args.recipe,
              output=out, p_hat=p, p_bac_binary=score,
              y_bac=sub["y_bac"].to_numpy(), soft_bac=sub["soft_bac"].to_numpy(),
@@ -856,9 +885,10 @@ def main(argv=None):
              test_cols=np.array(TESTS))
 
     y = sub["y_bac"].to_numpy()
-    mad = sub["study"].eq("MADURAI photos").to_numpy()
+    mad = np.array([STUDY_SHORT.get(s, s) for s in sub["study"]]) == "MADURAI"
     ev = part_flag == 1
-    metrics = {"reference": "LCA bin (binary, bacterial vs fungal)",
+    metrics = {"reference": ("two-class posterior > 0.5 (binary, bacterial vs fungal)" if args.labels_csv
+                             else "LCA bin (binary, bacterial vs fungal)"),
                "score": "(p_bac + 1 - p_fung) / 2",
                "test_all": binary_metrics(y, score, p),
                "eval": binary_metrics(y[ev], score[ev], p[ev]),
@@ -872,6 +902,21 @@ def main(argv=None):
             own[col] = {"n_images": int(m.sum()), "positive_share": float(np.mean(t[m])) if m.any() else None,
                         "auroc": float(roc_auc_score(t[m], p[m, j])) if len(np.unique(t[m])) == 2 else None}
         metrics["own_tests"] = own
+    if args.labels_csv:  # the paper's scoring: each output against Travis's hard label for that pathogen
+        def per_pathogen(m):
+            r = {"n_images": int(m.sum())}
+            for j, (name, h) in enumerate((("bacterial", "hard_bac"), ("fungal", "hard_fung"))):
+                t = sub[h].to_numpy()[m]
+                r[f"{name}_positive_share"] = float(t.mean()) if m.any() else None
+                r[f"{name}_auroc"] = float(roc_auc_score(t, p[m, j])) if len(np.unique(t)) == 2 else None
+                r[f"{name}_accuracy"] = float(np.mean((p[m, j] > 0.5) == (t == 1))) if m.any() else None
+            return r
+        metrics["per_pathogen_vs_hard_labels"] = {"test_all": per_pathogen(np.ones(len(test), bool)),
+                                                  "test_MADURAI": per_pathogen(mad),
+                                                  "test_other_studies": per_pathogen(~mad)}
+        pp = metrics["per_pathogen_vs_hard_labels"]["test_all"]
+        print(f"  per pathogen, all test images (paper's scoring): bacterial AUROC {pp['bacterial_auroc']}, "
+              f"fungal AUROC {pp['fungal_auroc']}")
     with open(os.path.join(out_dir, "test_metrics.json"), "w") as f:
         json.dump(metrics, f, indent=2)
     for k in ("eval", "eval_MADURAI", "eval_other_studies"):
