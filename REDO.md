@@ -31,8 +31,11 @@ Later updates arrive as bundles: `git pull /scratch90/chris_/<update>.bundle red
 
 ```bash
 cd /scratch90/chris_/ik_redo
-python src/eda_paper_data.py --train "training images.csv" --test "test images.csv" --out results/eda
+python src/eda_paper_data.py --train "training images.csv" --val "validation images.csv" \
+    --test "test images.csv" --out results/eda
 ```
+
+The validation file arrived on 27 Oct; `--val` is optional, so the earlier two-file run still works.
 
 It also compares against our study CSV (default
 `/persist/QTIM/Active/26-0096/Corneal_Ulcer_Image_Sets/Data/corneal_ulcer_study_data_7_24_2025_lambda.csv`;
@@ -57,8 +60,8 @@ Send back `results/eda/eda_report.md`: aggregates only, no subject IDs, paths or
 ## 2. Label table and image files
 
 ```bash
-python src/paper_labels.py --train "training images.csv" --test "test images.csv" --out results/labels \
-    --img_roots /pacs/OSHU/Corneal_Ulcer_Image_Sets /persist/QTIM/Active/26-0096/Corneal_Ulcer_Image_Sets
+python src/paper_labels.py --train "training images.csv" --val_csv "validation images.csv" \
+    --test "test images.csv" --out results/labels --img_roots /pacs/OSHU/Corneal_Ulcer_Image_Sets /persist/QTIM/Active/26-0096/Corneal_Ulcer_Image_Sets
 ```
 
 Writes `results/labels/paper_labels.csv` (identifiers; stays here) and `labels_report.md` (send).
@@ -82,8 +85,10 @@ OUT_ROOT=results/paper_split scripts/launch_redo.sh               # go (cuda:0 +
 | B_2c, D_2c | BD / twoclass_soft, twoclass_hard | same |
 | SM, CU | sigmoid / smear, culture (BCE) | each output vs its own test |
 
-Paper recipe throughout; trains on the full paper training split (no validation set: the recipe keeps
-the final epoch; `--val_share 0.15` would hold out 15% of training subjects to watch validation loss).
+Paper recipe throughout; trains on the full paper training split. With the validation file in the label
+table, validation loss is logged each epoch (and the best-validation model saved for reference), but the
+recipe keeps the final epoch, as the paper did. Without it, `--val_share 0.15` would hold out 15% of
+training subjects instead.
 Test split divided 20/80 into calibration/evaluation for conformal. Each run's `test_metrics.json`
 has `per_pathogen_vs_hard_labels` (all test images, MADURAI, other studies).
 About 5 GPU-hours in all (about 2.5 on two GPUs). If CU runs out of memory (two stages train):

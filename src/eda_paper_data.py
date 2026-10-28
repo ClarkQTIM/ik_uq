@@ -1,5 +1,6 @@
 """
-EDA of the original paper's data (Travis, 23 Oct 2026): "training images.csv" and "test images.csv".
+EDA of the original paper's data (Travis, 23 Oct 2026): "training images.csv" and "test images.csv",
+plus "validation images.csv" with --val (27 Oct 2026).
 
 Columns: subject, Drive_image_path, fung_smear, bac_cult_positive, fung_cult_positive, bac_smear,
 fung_post_prob, bac_post_prob.
@@ -22,7 +23,7 @@ What this answers (see the "Answers" section of the report):
 Prints and writes aggregates only: no subject IDs, paths or image names.
 
     python src/eda_paper_data.py --train "training images.csv" --test "test images.csv" \
-        --out results/eda [--old_csv /persist/.../corneal_ulcer_study_data_7_24_2025_lambda.csv]
+        [--val "validation images.csv"] --out results/eda [--old_csv /persist/.../corneal_ulcer_study_data_7_24_2025_lambda.csv]
 """
 
 import argparse
@@ -176,6 +177,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--train", required=True)
     ap.add_argument("--test", required=True)
+    ap.add_argument("--val", default=None, help="the paper's validation file, if we have it")
     ap.add_argument("--out", required=True)
     ap.add_argument("--old_csv", default=DEFAULT_OLD_CSV, help="our study CSV; 'none' to skip the comparison")
     ap.add_argument("--img_root", default=DEFAULT_IMG_ROOT, help="where the old CSV's image paths live")
@@ -192,14 +194,19 @@ def main():
 
     tr, rv_tr = load_paper(a.train, "train", notes)
     te, rv_te = load_paper(a.test, "test", notes)
-    d = pd.concat([tr, te], ignore_index=True)
+    loaded = [("train", tr, rv_tr), ("test", te, rv_te)]
+    if a.val:
+        va, rv_va = load_paper(a.val, "val", notes)
+        loaded.insert(1, ("val", va, rv_va))
+    SPLITS = [x[0] for x in loaded]
+    d = pd.concat([x[1] for x in loaded], ignore_index=True)
 
     # ---- 0. Files and raw values -----------------------------------------------------
     files = pd.DataFrame([{"split": s, "rows": int((d.split == s).sum()), "subjects": int(d[d.split == s].subject.nunique())}
-                          for s in ("train", "test")] + [{"split": "both", "rows": len(d), "subjects": int(d.subject.nunique())}])
+                          for s in SPLITS] + [{"split": "all", "rows": len(d), "subjects": int(d.subject.nunique())}])
     files["image share"] = files["rows"] / len(d)
     raw = pd.DataFrame([{"column": c, "split": s, "raw values (top 8, with counts)": "; ".join(f"{k}: {v}" for k, v in rv[c].items())}
-                        for s, rv in (("train", rv_tr), ("test", rv_te)) for c in TESTS + POSTS])
+                        for s, _, rv in loaded for c in TESTS + POSTS])
     section("0. Files", md(save(files, "files.csv")),
             f"Paper: {PAPER_IMAGES:,} images, {PAPER_PARTICIPANTS:,} participants. Here: {len(d):,} images, "
             f"{d.subject.nunique():,} subjects.", "Raw values as read (before coding; numbers only, no identifiers):\n\n" + md(raw))
@@ -221,12 +228,12 @@ def main():
                                              followups=("is_followup", "sum")).reset_index())
     vis = pd.crosstab([d.study, d.visit], d.split).reset_index()
     dup_path = int(d.duplicated(["Drive_image_path"]).sum())
-    dup_within = {s: int(d[d.split == s].duplicated(["Drive_image_path"]).sum()) for s in ("train", "test")}
-    cross_path = len(set(tr["Drive_image_path"]) & set(te["Drive_image_path"]))
-    cross_base = len(set(tr["basename"].str.lower()) & set(te["basename"].str.lower()))
+    dup_within = {s: int(d[d.split == s].duplicated(["Drive_image_path"]).sum()) for s in SPLITS}
+    within_txt = ", ".join(f"within {s} {n}" for s, n in dup_within.items())
+    cross_path = int((d.groupby("Drive_image_path")["split"].nunique() > 1).sum())
+    cross_base = int((d.assign(_b=d["basename"].str.lower()).groupby("_b")["split"].nunique() > 1).sum())
     if dup_path:
-        notes.append(f"{dup_path} duplicated image paths (within train {dup_within['train']}, within test "
-                     f"{dup_within['test']}, across splits {cross_path})")
+        notes.append(f"{dup_path} duplicated image paths ({within_txt}, across splits {cross_path})")
     sub_rows = []
     for stdy, g in d.groupby("study"):
         sf = g["subfolder"]
@@ -239,20 +246,23 @@ def main():
             "Study = the study folder (shallowest folder named after a study); subfolders below it:\n\n"
             + md(save(pd.DataFrame(sub_rows), "subfolders_by_study.csv"), ".0f"),
             md(save(st, "studies_by_split.csv")), "Visits (parsed from image names):\n\n" + md(save(vis, "visits_by_study.csv")),
-            f"Duplicated paths: {dup_path} (within train {dup_within['train']}, within test {dup_within['test']}, "
-            f"same path in both splits {cross_path}); same file name in both splits: {cross_base}.")
+            f"Duplicated paths: {dup_path} ({within_txt}, same path in more than one split {cross_path}); "
+            f"same file name in more than one split: {cross_base}.")
 
     # ---- 2. Subjects and the split ----------------------------------------------------------
     per_sub = d.groupby(["split", "subject"]).size()
     ips = per_sub.groupby(level=0).describe()[["count", "mean", "50%", "max"]].reset_index()
-    both = set(tr.subject) & set(te.subject)
+    subj_split = d.groupby("subject")["split"].nunique()
+    both = set(subj_split[subj_split > 1].index)
+    pair_txt = "; ".join(f"{x} and {y}: {len(set(d[d.split == x].subject) & set(d[d.split == y].subject))}"
+                         for i, x in enumerate(SPLITS) for y in SPLITS[i + 1:])
     multi_study = int((d.groupby("subject")["study"].nunique() > 1).sum())
     if both:
-        notes.append(f"{len(both)} subjects have images in both train and test")
+        notes.append(f"{len(both)} subjects have images in more than one split ({pair_txt})")
     section("2. Subjects and the split",
             "Images per subject:\n\n" + md(ips.rename(columns={"count": "subjects", "50%": "median"})
                                              .astype({"subjects": int, "median": int, "max": int})),
-            f"Subjects in both train and test: {len(both)} ({int(d[d.subject.isin(both)].shape[0])} images). "
+            f"Subjects in more than one split: {len(both)} ({int(d[d.subject.isin(both)].shape[0])} images; {pair_txt}). "
             f"Subjects appearing in more than one study: {multi_study}.")
 
     # ---- 3. Tests ---------------------------------------------------------------------------
@@ -508,6 +518,9 @@ def main():
         old["visit"] = [parse_visit(s, n) if s in STUDY_SHORT else "unknown"
                         for s, n in zip(old["study"].astype(str), old["basename"])]
         left = pd.crosstab([old.study_s, old.visit], old_m.map({True: "in paper set", False: "not in paper set"})).reset_index()
+        out_rows = old[~old_m.to_numpy()]
+        out_fu = out_rows.visit.isin(FOLLOWUP_VISITS)
+        left_out = (len(out_rows), int(out_fu.sum()), out_rows[~out_fu].study_s.value_counts())
         # subject vs pID, split by pID
         sub_lines = []
         if "pID" in o and matched.any():
@@ -520,10 +533,10 @@ def main():
             sub_lines.append(f"Paper subjects mapping to more than one pID: {int((s2p > 1).sum())}; pIDs mapping to more "
                              f"than one paper subject: {int((p2s > 1).sum())}.")
             leak = mm.groupby("pID")["split"].nunique()
-            sub_lines.append(f"pIDs with images in both paper train and test: {int((leak > 1).sum())} "
+            sub_lines.append(f"pIDs with images in more than one paper split: {int((leak > 1).sum())} "
                              f"({int(mm[mm.pID.isin(leak[leak > 1].index)].shape[0])} images).")
             if (leak > 1).any():
-                notes.append(f"{int((leak > 1).sum())} participants (by pID) are in both the paper's train and test sets")
+                notes.append(f"{int((leak > 1).sum())} participants (by pID) are in more than one of the paper's splits")
         # image files on disk
         exist_line = ""
         if "file_path" in o and matched.any():
@@ -538,7 +551,7 @@ def main():
                 "Posteriors, paper vs ours:\n\n" + md(save(pd.DataFrame(prow), "old_vs_paper_posteriors.csv")),
                 "Travis's hard labels vs our LCA bins:\n\n" + md(pd.DataFrame(brow)),
                 "Our images in and out of the paper set, by study and visit:\n\n" + md(save(left, "old_in_paper_set.csv"), ".0f"))
-        answers_old = (matched, filled_by_study)
+        answers_old = (matched, filled_by_study, left_out)
         d["_our_path"] = np.where(matched, o["file_path"].astype(str).str.replace(PACS_PREFIX, a.img_root, regex=False), "")
     else:
         section("8. Against our CSV", f"Skipped (no old CSV at {a.old_csv}).")
@@ -559,20 +572,23 @@ def main():
     section("9. Image files on disk for the paper's images",
             f"Looked up through our CSV (matched images) and as `{a.img_root}/<study folder>/<subfolder>/<file>` "
             "(the paper's relative path).\n\n" + md(save(files_tab, "image_files.csv"), ".0f"))
-    files_answer = (f"**Image files.** Found on disk for {int(d._found.sum()):,} of {len(d):,} paper images "
-                   f"(train {int(d[d.split == 'train']._found.sum()):,} of {int((d.split == 'train').sum()):,}, test "
-                   f"{int(d[d.split == 'test']._found.sum()):,} of {int((d.split == 'test').sum()):,}); missing by study: "
+    files_answer = (f"**Image files.** Found on disk for {int(d._found.sum()):,} of {len(d):,} paper images ("
+                   + ", ".join(f"{s} {int(d[d.split == s]._found.sum()):,} of {int((d.split == s).sum()):,}" for s in SPLITS)
+                   + "); missing by study: "
                    + (", ".join(f"{k} {v}" for k, v in d[~d._found].study.value_counts().items()) or "none") + ".")
 
     # ---- Answers ----------------------------------------------------------------------------------------
     answers.append(f"**Images and participants.** {len(d):,} images, {d.subject.nunique():,} subjects "
-                   f"(paper: {PAPER_IMAGES:,} / {PAPER_PARTICIPANTS:,}); train {len(tr):,} / test {len(te):,} images. "
+                   f"(paper: {PAPER_IMAGES:,} / {PAPER_PARTICIPANTS:,}); "
+                   + " / ".join(f"{s} {int((d.split == s).sum()):,}" for s in SPLITS) + " images. "
                    f"Follow-up photos: {int(d.is_followup.sum()):,}. Studies: "
                    + ", ".join(f"{k} {v:,}" for k, v in d.study.value_counts().items()) + ".")
-    answers.append(f"**A missing validation set?** These files hold {len(d) / PAPER_IMAGES:.1%} of the paper's images and "
-                   f"{d.subject.nunique() / PAPER_PARTICIPANTS:.1%} of its participants; train is {len(tr) / PAPER_IMAGES:.1%} "
-                   f"and test {len(te) / PAPER_IMAGES:.1%} of the paper's images (the paper split 70/15/15).")
-    answers.append(f"**Split grouped by participant?** Subjects in both train and test: {len(both)}.")
+    answers.append(f"**{'All three files.' if a.val else 'A missing validation set?'}** These files hold "
+                   f"{len(d) / PAPER_IMAGES:.1%} of the paper's images ({len(d):,} of {PAPER_IMAGES:,}) and "
+                   f"{d.subject.nunique() / PAPER_PARTICIPANTS:.1%} of its participants ({d.subject.nunique():,} of "
+                   f"{PAPER_PARTICIPANTS:,}); " + ", ".join(f"{s} {int((d.split == s).sum()) / PAPER_IMAGES:.1%}" for s in SPLITS)
+                   + " of the paper's images (the paper split 70/15/15).")
+    answers.append(f"**Split grouped by participant?** Subjects in more than one split: {len(both)} ({pair_txt}).")
     mutt = d[d.study.isin(["MUTT1", "MUTT2", "MUTT Pilot"])]
     scut = d[d.study == "SCUT"]
     if len(mutt) or len(scut):
@@ -598,12 +614,15 @@ def main():
     answers.append("**Travis's hard labels** [bacterial, fungal]: " + ", ".join(f"[{k}] {vc.get(k, 0):,}" for k in ("1,0", "0,1", "1,1", "0,0"))
                    + f"; [0,0] with no test recorded at all: {int((d.no_tests & (d.hard_combo == '0,0')).sum()):,}.")
     if answers_old is not None:
-        matched, _ = answers_old
+        matched, _, (n_out, n_out_fu, out_other) = answers_old
         answers.append(f"**Against our CSV.** {int(matched.sum()):,} of {len(d):,} paper images matched to our rows.")
+        answers.append(f"**Our photos in none of the paper's files.** {n_out:,} of our CSV rows: {n_out_fu:,} follow-ups and "
+                       f"{int(out_other.sum()):,} others (" + ", ".join(f"{k} {v:,}" for k, v in out_other.items()) + ").")
     answers.append(files_answer)
 
     with open(os.path.join(a.out, "eda_report.md"), "w") as f:
-        f.write("# EDA of the paper's data (training images.csv, test images.csv)\n\n"
+        f.write("# EDA of the paper's data (" + ", ".join(os.path.basename(x[0]) for x in ((a.train,), (a.val,), (a.test,)) if x[0])
+                + ")\n\n"
                 "Aggregates only; no identifiers.\n\n## Answers\n\n" + "\n".join(f"- {x}" for x in answers) + "\n\n")
         f.write("## Things to look at\n\n" + ("\n".join(f"- {x}" for x in notes) if notes else "- none flagged") + "\n\n")
         for title, text in S:
