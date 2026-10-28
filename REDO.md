@@ -82,7 +82,9 @@ Two analyses (decided 28 Oct), both with two independent outputs and Travis's po
   for bacterial, PDA for fungal); scored against the cultures.
 
 For each, the report gives images and patients by split and study, hard-label combinations, where soft and
-hard labels differ, the evaluation set, cultures vs LCA labels, and what the missing photos take away. Each
+hard labels differ, the evaluation set, cultures vs LCA labels, what can be scored in each study (only MADURAI
+has both labels; a study-only 'model' and how much of a pooled AUROC is within-study pairs), and what the
+missing photos take away. Each
 comes twice: **full** (everything in the paper's files) and **provisional** (images on our server now).
 Send back `results/analysis_sets/analysis_sets.md`.
 
@@ -108,7 +110,8 @@ Five KL settings (published; Sensoy form 0.01, 0.1, 1; ICMLA form 1) x BD soft a
 scores its validation images: discrimination (AUROC against the analysis's reference) and how well low evidence
 flags the errors (entropy alongside). `select_kl.py` reports both with patient-level bootstrap intervals and
 picks the best discrimination, the best evidence, and the proposed rule (best evidence within 0.02 AUROC of the
-best). Never the validation loss: it contains the KL term. Send back
+best). Discrimination for the picks is MADURAI's (`--disc_scope`): the trials each have one diagnosis, so a
+pooled AUROC mostly rewards telling the studies apart. Never the validation loss: it contains the KL term. Send back
 `results/provisional_kl/kl_selection/kl_selection.md`. The chosen BD runs are the main BD runs; step 6 then only
 needs the sigmoid runs and baselines (`SETUPS="A_cul C_cul A_lca C_lca SM CU"`).
 
@@ -131,7 +134,8 @@ OUT_ROOT=results/provisional scripts/launch_redo.sh                # go (cuda:0 
 Soft and hard runs in each analysis share everything but the labels (paper recipe, rescaled MSE or the
 evidential loss). Every run's `test_metrics.json` scores each output against both references where it can:
 `per_pathogen_vs_hard_labels` and `per_pathogen_vs_culture` (all test images, MADURAI, other studies,
-evaluation set).
+evaluation set), and `by_study_eval`: the pooled AUROC split into within-study and between-study pairs, and
+per-study measures that work with one class (share called correctly, mean prediction).
 
 **Provisional vs full.** The label table only uses images with a file, so a run today is the provisional
 version. The culture analysis is nearly final already (every MADURAI photo is here; SCUT is short). When

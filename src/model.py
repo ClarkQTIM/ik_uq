@@ -68,6 +68,7 @@ from torchvision.transforms import InterpolationMode
 from tqdm import tqdm
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from study_scoring import pair_auroc, per_study  # noqa: E402
 from labels import (CULTURES, PAPER_LABEL_TYPES, STUDY_SHORT, TEST_TARGETS, TESTS,  # noqa: E402
                     has_culture, label_summary, load_labelled, load_paper_table, participant_codes,
                     split_by_participant, split_cv, split_paper, targets, test_results)
@@ -996,6 +997,15 @@ def main(argv=None):
                                               "test_other_studies": per_pathogen_culture(~mad),
                                               "eval": per_pathogen_culture(ev)}
         metrics["per_pathogen_vs_hard_labels"]["eval"] = per_pathogen(ev)
+        # the study confound: only MADURAI has both labels, so split the pooled AUROC into within-study and
+        # between-study pairs, and score each study with measures that work when it has one class only
+        st_all = np.array([STUDY_SHORT.get(x, x) for x in sub["study"]])
+        refs = {"lca_hard_labels": sub[["hard_bac", "hard_fung"]].to_numpy(dtype=float), "culture": cul.astype(float)}
+        metrics["by_study_eval"] = {
+            rname: {name: {"pairs": pair_auroc(ref[ev, j], p[ev, j], st_all[ev]),
+                           "per_study": per_study(ref[ev, j], p[ev, j], st_all[ev])}
+                    for j, name in enumerate(("bacterial", "fungal"))}
+            for rname, ref in refs.items()}
         pc = metrics["per_pathogen_vs_culture"]["test_all"]
         print(f"  per pathogen vs culture, test images with a culture: bacterial AUROC {pc['bacterial_auroc']}, "
               f"fungal AUROC {pc['fungal_auroc']}")

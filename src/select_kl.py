@@ -5,7 +5,9 @@ scripts/launch_kl_redo.sh. Test images are never used.
 Two things are wanted from a BD model, and they can pull apart (a stronger KL term has given better evidence and
 lower AUROC), so both are reported and three picks made, each fixed before the sweep:
   discrimination   mean over the two outputs of the validation AUROC against the analysis's reference
-                   (LCA analysis: posterior > 0.5; culture analysis: blood agar, PDA)
+                   (LCA analysis: posterior > 0.5; culture analysis: blood agar, PDA), within MADURAI by default
+                   (--disc_scope): every other study has one diagnosis, so a pooled AUROC mostly rewards telling
+                   the studies apart
   evidence         mean over the two outputs of how well low evidence (-(alpha + beta)) flags the validation
                    errors (AUROC, wrong vs right at 0.5); entropy's own figure is shown alongside
   picks            best discrimination; best evidence; and the proposed rule: the best evidence among settings
@@ -65,6 +67,8 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--runs", required=True, help="folder holding the sweep's run folders")
     ap.add_argument("--tolerance", type=float, default=0.02)
+    ap.add_argument("--disc_scope", default="MADURAI", choices=["MADURAI", "all"],
+                    help="images whose AUROC the picks use (default MADURAI: the only study with both labels)")
     ap.add_argument("--boot", type=int, default=500)
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--out", default=None, help="default: <runs>/kl_selection")
@@ -101,14 +105,16 @@ def main():
         g = g[g[col].notna()]
         return g.loc[g[col].idxmax(), "KL"] if len(g) else "n/a (undefined)"
 
+    dcol = f"{a.disc_scope}: discrimination"
+
     def picks(g, who):
-        best_d = g["all: discrimination"].max()
-        ok = g[g["all: discrimination"] >= best_d - a.tolerance] if np.isfinite(best_d) else g.iloc[:0]
-        return {"choice for": who, "best discrimination": best(g, "all: discrimination"),
+        best_d = g[dcol].max()
+        ok = g[g[dcol] >= best_d - a.tolerance] if np.isfinite(best_d) else g.iloc[:0]
+        return {"choice for": who, f"best discrimination ({a.disc_scope})": best(g, dcol),
                 "best evidence": best(g, "all: evidence"),
                 f"rule (best evidence, discrimination within {a.tolerance})": best(ok, "all: evidence")}
     pk = [picks(g, f"{an}, {lb}") for (an, lb), g in t.groupby(["analysis", "label"])]
-    pooled = (t.groupby(["analysis", "KL"])[["all: discrimination", "all: evidence"]].mean().reset_index())
+    pooled = (t.groupby(["analysis", "KL"])[[dcol, "all: evidence"]].mean().reset_index())
     pk += [picks(g.reset_index(drop=True), f"{an}, soft and hard together") for an, g in pooled.groupby("analysis")]
     pk = pd.DataFrame(pk)
     pk.to_csv(os.path.join(out_dir, "kl_picks.csv"), index=False)

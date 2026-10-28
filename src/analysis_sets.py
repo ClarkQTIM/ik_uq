@@ -25,6 +25,7 @@ import pandas as pd
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from eda_paper_data import md  # noqa: E402
 from labels import has_culture, load_paper_table, split_paper, targets  # noqa: E402
+from study_scoring import study_only  # noqa: E402
 
 ANALYSES = {"LCA": ("paper_hard", "all images; hard = LCA posterior > 0.5"),
             "culture": ("culture_hard", "images with a culture; hard = blood agar (bacterial), PDA (fungal)")}
@@ -158,6 +159,37 @@ def main():
     rec_tab = rec_tab.groupby("study")[["both cultures", "one culture"]].sum().reset_index()
     S.append(("Culture analysis: cultures vs LCA hard labels (full)",
               md(save(pd.DataFrame(rows), "culture_vs_lca.csv")) + "\n\nCultures recorded:\n\n" + md(rec_tab, ".0f")))
+
+    # ---- what can be scored where (the study confound) ----------------------------------------------------------------
+    rows = []
+    for (an, v), d in sets.items():
+        ev = d[d.part == "eval"]
+        for st, g in ev.groupby("study"):
+            r = {"analysis": an, "version": v, "study": st, "evaluation images (patients)": ip(g)}
+            for pth, name in (("bac", "bacterial"), ("fung", "fungal")):
+                y = g[f"h_{pth}"].dropna()
+                r[f"{name} +/-"] = f"{int(y.sum())}/{int((y == 0).sum())}"
+                r[f"{name} AUROC here"] = "yes" if y.nunique() == 2 else "no"
+            r["distinct soft labels"] = int(g[["s_bac", "s_fung"]].round(4).drop_duplicates().shape[0])
+            rows.append(r)
+    where = save(pd.DataFrame(rows), "scorable_by_study.csv")
+    rows = []
+    for (an, v), d in sets.items():
+        tr, ev = d[d.split == "train"], d[d.part == "eval"]
+        for pth, name in (("bac", "bacterial"), ("fung", "fungal")):
+            so = study_only(tr[f"h_{pth}"], tr.study, ev[f"h_{pth}"], ev.study)
+            rows.append({"analysis": an, "version": v, "output": name,
+                         "study-only AUROC, pooled": so["auroc_pooled"],
+                         "within-study pairs": so["auroc_within_study_pairs"],
+                         "between-study pairs": so["auroc_between_study_pairs"],
+                         "share of pairs within one study": so["share_of_pairs_within_study"]})
+    base = save(pd.DataFrame(rows), "study_only_baseline.csv")
+    S.append(("What can be scored where: only MADURAI has both labels",
+              "Every trial enrolled one diagnosis, so inside a trial each output has only positives or only "
+              "negatives (and one soft label): no AUROC there. Evaluation set, by study:\n\n" + md(where)
+              + "\n\nA 'model' that only knows the study (its training positive rate) scores this pooled AUROC on the "
+              "evaluation set; within-study pairs are all MADURAI pairs, where it can only tie (0.5). The share column "
+              "is how much of any pooled AUROC comes from pairs inside one study.\n\n" + md(base)))
 
     # ---- what the missing photos take away ------------------------------------------------------------------------------
     rows = []
