@@ -65,3 +65,22 @@ def per_study(y, p, study):
                      auroc=float(roc_auc_score(t, q)) if len(np.unique(t)) == 2 else None)
         out[str(st)] = r
     return out
+
+
+def same_label_study_gap(hard, p, study):
+    """Does the model's output separate studies when the diagnosis is the same? Among fungal-only images: AUROC of
+    the fungal output for trial vs MADURAI; among bacterial-only images: the same with the bacterial output. Near 0.5
+    means the output carries no study signal at a fixed diagnosis; far from 0.5 means it does (shortcut or a real
+    difference in how the ulcers look)."""
+    hard, p, study = np.asarray(hard, float), np.asarray(p, float), np.asarray(study)
+    out = {}
+    for name, j, sel in (("fungal-only images, fungal output", 1, (hard[:, 1] == 1) & (hard[:, 0] == 0)),
+                         ("bacterial-only images, bacterial output", 0, (hard[:, 0] == 1) & (hard[:, 1] == 0))):
+        trial = study[sel] != "MADURAI"
+        r = {"n_MADURAI": int((~trial).sum()), "n_trials": int(trial.sum())}
+        if trial.any() and (~trial).any():
+            q = p[sel, j]
+            r.update(mean_output_MADURAI=float(q[~trial].mean()), mean_output_trials=float(q[trial].mean()),
+                     auroc_trials_vs_MADURAI=float(roc_auc_score(trial, q)))
+        out[name] = r
+    return out

@@ -68,7 +68,7 @@ from torchvision.transforms import InterpolationMode
 from tqdm import tqdm
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from study_scoring import pair_auroc, per_study  # noqa: E402
+from study_scoring import pair_auroc, per_study, same_label_study_gap  # noqa: E402
 from labels import (CULTURES, PAPER_LABEL_TYPES, STUDY_SHORT, TEST_TARGETS, TESTS,  # noqa: E402
                     has_culture, label_summary, load_labelled, load_paper_table, participant_codes,
                     split_by_participant, split_cv, split_paper, targets, test_results)
@@ -1006,6 +1006,8 @@ def main(argv=None):
                            "per_study": per_study(ref[ev, j], p[ev, j], st_all[ev])}
                     for j, name in enumerate(("bacterial", "fungal"))}
             for rname, ref in refs.items()}
+        metrics["by_study_eval"]["same_label_study_gap"] = same_label_study_gap(refs["lca_hard_labels"][ev], p[ev],
+                                                                               st_all[ev])
         pc = metrics["per_pathogen_vs_culture"]["test_all"]
         print(f"  per pathogen vs culture, test images with a culture: bacterial AUROC {pc['bacterial_auroc']}, "
               f"fungal AUROC {pc['fungal_auroc']}")

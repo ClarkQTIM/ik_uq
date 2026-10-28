@@ -98,6 +98,22 @@ Fits the paper's two-class LCA, the same with a random effect (tests correlated 
 two-pathogen model (bacterial only / fungal only / both / neither) to the four tests of the MADURAI subjects.
 Send back `results/lca_states/lca_states_report.md`.
 
+## 4b. Can a model tell the study from the photo? (a few minutes on a GPU)
+
+```bash
+python src/study_probe.py --labels results/labels/paper_labels.csv --out results/study_probe
+# later, the same on a trained run's fine-tuned backbone:
+python src/study_probe.py --labels results/labels/paper_labels.csv --out results/study_probe_A_cul \
+    --checkpoint results/provisional/<A_cul run folder>/model.pt
+```
+
+A linear probe on backbone features (ImageNet-pretrained, not fine-tuned, by default), 5-fold cross-validation
+grouped by patient: which study (all images); which study among fungal-only images and among bacterial-only images
+(same diagnosis, different study); MADURAI vs trials at the same diagnosis; which hospital within MUTT1, MUTT2 and
+SCUT. Near chance means no study signal beyond the diagnosis; near 1 means the shortcut is open. Every training run
+also reports `by_study_eval.same_label_study_gap`: at the same diagnosis, how well its output separates trial from
+MADURAI images. Send back `results/study_probe/study_probe.md`.
+
 ## 5. Choose BD's KL setting on validation (first)
 
 ```bash
