@@ -68,8 +68,8 @@ from torchvision.transforms import InterpolationMode
 from tqdm import tqdm
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from labels import (PAPER_LABEL_TYPES, STUDY_SHORT, TEST_TARGETS, TESTS,  # noqa: E402
-                    label_summary, load_labelled, load_paper_table, participant_codes,
+from labels import (CULTURES, PAPER_LABEL_TYPES, STUDY_SHORT, TEST_TARGETS, TESTS,  # noqa: E402
+                    has_culture, label_summary, load_labelled, load_paper_table, participant_codes,
                     split_by_participant, split_cv, split_paper, targets, test_results)
 
 DEFAULT_CSV = ("/persist/QTIM/Active/26-0096/Corneal_Ulcer_Image_Sets/Data/"
@@ -102,6 +102,9 @@ def get_args(argv=None):
                         "paper_soft / paper_hard / twoclass_soft / twoclass_hard: the redo table (--labels_csv)")
     p.add_argument("--labels_csv", default=None,
                    help="redo: paper_labels.csv from src/paper_labels.py (the paper's images, split and labels)")
+    p.add_argument("--subset", default="all", choices=["all", "culture"],
+                   help="redo: 'culture' keeps only images with at least one culture (blood agar or PDA) in every "
+                        "split: the culture analysis")
     p.add_argument("--val_share", type=float, default=0.0,
                    help="redo, no validation file: share of training subjects held out to monitor "
                         "validation loss (default 0: none; the paper recipe never uses it to pick a model)")
@@ -145,9 +148,14 @@ def get_args(argv=None):
     args = p.parse_args(argv)
     if args.labels_csv:
         if args.label_type in ("soft", "hard"):
-            p.error("with --labels_csv use paper_soft, paper_hard, twoclass_soft, twoclass_hard, smear or culture")
+            p.error("with --labels_csv use paper_soft, paper_hard, culture_hard, twoclass_soft, twoclass_hard, "
+                    "smear or culture")
+        if args.label_type == "culture_hard" and args.subset != "culture":
+            p.error("--label_type culture_hard needs --subset culture (images with a culture)")
         if args.group_col == "pID":
             args.group_col = "subject"
+    elif args.subset != "all":
+        p.error("--subset needs --labels_csv")
     elif args.label_type in PAPER_LABEL_TYPES:
         p.error(f"--label_type {args.label_type} needs --labels_csv")
     if args.label_type in TEST_TARGETS:
@@ -200,7 +208,8 @@ def make_output_dir(args):
         kl = ("" if (args.kl_schedule, args.kl_form) == ("icmla", "sensoy")
               else f"_kl-{args.kl_schedule}{args.kl_max if args.kl_max is not None else ''}-{args.kl_form}")
         fold = f"_fold{args.fold}of{args.n_folds}" if args.n_folds else ""
-        name = args.run_name or f"{args.head}_{args.label_type}_{args.recipe}{kl}{fold}_{ts}"
+        sub = "_culture-subset" if args.subset == "culture" else ""
+        name = args.run_name or f"{args.head}_{args.label_type}{sub}_{args.recipe}{kl}{fold}_{ts}"
         if args.smoke:
             name = "SMOKE_" + name
         out_dir = os.path.join(args.out_root, name)
@@ -737,6 +746,11 @@ def main(argv=None):
     # --- Labels and split -----------------------------------------------------
     if args.labels_csv:  # redo: the paper's images, split and labels
         df = load_paper_table(args.labels_csv)
+        if args.subset == "culture":  # the culture analysis: images with at least one culture, in every split
+            keep = has_culture(df)
+            print(f"Culture subset: {int(keep.sum()):,} of {len(df):,} images "
+                  f"({df.loc[keep, 'subject'].nunique():,} patients) have a culture.")
+            df = df[keep].reset_index(drop=True)
     else:
         df = load_labelled(args.csv, args.img_root, args.group_col)
     if args.n_folds:
@@ -753,6 +767,9 @@ def main(argv=None):
     y_all = targets(df, args.label_type, args.group_col)
     no_target = np.isnan(y_all).all(axis=1)  # test-supervised: neither test done
     tr, va = parts["train"], parts["val"]
+    if not test_supervised and np.isnan(y_all).any():  # rescaled MSE / evidential losses need both targets
+        raise SystemExit(f"{int(np.isnan(y_all).any(axis=1).sum())} images lack a {args.label_type} target for one "
+                         "pathogen (e.g. one culture only); this loss needs both.")
     if test_supervised:  # only images with at least one of the two tests can train
         tr, va = tr[~no_target[tr]], va[~no_target[va]]
     if args.smoke:  # a small random subset of each part
@@ -914,6 +931,28 @@ def main(argv=None):
         metrics["per_pathogen_vs_hard_labels"] = {"test_all": per_pathogen(np.ones(len(test), bool)),
                                                   "test_MADURAI": per_pathogen(mad),
                                                   "test_other_studies": per_pathogen(~mad)}
+        cul = test_results(df, args.group_col)[test][:, [TESTS.index(c) for c in CULTURES]]
+
+        def per_pathogen_culture(m):
+            r = {}
+            for j, name in enumerate(("bacterial", "fungal")):
+                k = m & ~np.isnan(cul[:, j])
+                t = cul[k, j]
+                r[f"{name}_n_images"] = int(k.sum())
+                r[f"{name}_positive_share"] = float(t.mean()) if k.any() else None
+                r[f"{name}_auroc"] = float(roc_auc_score(t, p[k, j])) if len(np.unique(t)) == 2 else None
+                r[f"{name}_accuracy"] = float(np.mean((p[k, j] > 0.5) == (t == 1))) if k.any() else None
+            return r
+        # the culture analysis's reference: blood agar for the bacterial output, PDA for the fungal one,
+        # on the test images where that culture was done (all test images when --subset culture)
+        metrics["per_pathogen_vs_culture"] = {"test_all": per_pathogen_culture(np.ones(len(test), bool)),
+                                              "test_MADURAI": per_pathogen_culture(mad),
+                                              "test_other_studies": per_pathogen_culture(~mad),
+                                              "eval": per_pathogen_culture(ev)}
+        metrics["per_pathogen_vs_hard_labels"]["eval"] = per_pathogen(ev)
+        pc = metrics["per_pathogen_vs_culture"]["test_all"]
+        print(f"  per pathogen vs culture, test images with a culture: bacterial AUROC {pc['bacterial_auroc']}, "
+              f"fungal AUROC {pc['fungal_auroc']}")
         pp = metrics["per_pathogen_vs_hard_labels"]["test_all"]
         print(f"  per pathogen, all test images (paper's scoring): bacterial AUROC {pp['bacterial_auroc']}, "
               f"fungal AUROC {pp['fungal_auroc']}")

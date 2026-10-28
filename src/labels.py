@@ -36,7 +36,10 @@ PACS_PREFIX = "/pacs/OSHU/Corneal_Ulcer_Image_Sets"
 # Smear and culture columns: 1 positive, 0 negative, -1 missing.
 TESTS = ["bac_smear", "fung_smear", "bac_cult_positive", "fung_cult_positive"]
 # Label types read from the redo table (src/paper_labels.py -> paper_labels.csv)
-PAPER_LABEL_TYPES = ["paper_soft", "paper_hard", "twoclass_soft", "twoclass_hard"]
+# culture_hard: the cultures themselves as hard labels (blood agar -> bacterial, PDA -> fungal), for the culture
+# analysis (images with at least one culture; --subset culture), trained with the same loss as the soft labels.
+PAPER_LABEL_TYPES = ["paper_soft", "paper_hard", "culture_hard", "twoclass_soft", "twoclass_hard"]
+CULTURES = ["bac_cult_positive", "fung_cult_positive"]
 TEST_TARGETS = {"smear": ["bac_smear", "fung_smear"],                    # Gram, KOH
                 "culture": ["bac_cult_positive", "fung_cult_positive"]}  # blood agar, PDA
 FOLLOWUP_VISITS = {"3 weeks", "3 months", "12 months", "3E (unclear)"}
@@ -181,7 +184,12 @@ def test_results(df, group_col="pID"):
     return per_participant.reindex(df[group_col]).to_numpy(dtype=np.float32)
 
 
-def load_paper_table(path, verbose=True):
+def has_culture(df):
+    """Images with at least one culture recorded (blood agar or PDA): the culture analysis."""
+    return df[CULTURES].apply(pd.to_numeric, errors="coerce").isin([0, 1]).any(axis=1).to_numpy()
+
+
+def load_paper_table(path, verbose=True, require_image=True):
     """
     The redo label table written by src/paper_labels.py: one row per paper image with its local file,
     the paper's split, the four tests, the paper's per-pathogen posteriors, Travis's hard labels and the
@@ -200,10 +208,11 @@ def load_paper_table(path, verbose=True):
     if miss:
         raise ValueError(f"{path}: missing columns {miss}")
     n0 = len(t)
-    t = t[t["has_image"].astype(bool)]
+    if require_image:
+        t = t[t["has_image"].astype(bool)]
     t = t[t[["paper_soft_bac", "paper_soft_fung", "twoclass_bac"]].notna().all(axis=1)].copy()
     t["subject"] = t["subject"].astype(str)
-    t["local_path"] = t["local_path"].astype(str)
+    t["local_path"] = t["local_path"].fillna("").astype(str)
     t["image_name"] = t["local_path"].map(os.path.basename)
     t["y_bac"] = (t["twoclass_bac"] > 0.5).astype(int)
     t["soft_bac"] = t["twoclass_bac"].astype(float)
@@ -236,7 +245,10 @@ def split_paper(df, seed=42, group_col="subject", val_share=0.0):
         tr_rel, va_rel = next(GroupShuffleSplit(1, test_size=val_share, random_state=seed)
                               .split(tr, groups=groups[tr]))
         tr, va = tr[tr_rel], tr[va_rel]
-    ca_rel, ev_rel = next(GroupShuffleSplit(1, test_size=0.80, random_state=seed).split(te, groups=groups[te]))
+    if len(te):
+        ca_rel, ev_rel = next(GroupShuffleSplit(1, test_size=0.80, random_state=seed).split(te, groups=groups[te]))
+    else:
+        ca_rel = ev_rel = np.array([], dtype=int)
     parts = {"train": tr, "val": va, "test": te, "cal": te[ca_rel], "eval": te[ev_rel]}
     for a, b in [("train", "val"), ("train", "test"), ("val", "test"), ("cal", "eval")]:
         shared = set(groups[parts[a]]) & set(groups[parts[b]])
@@ -264,6 +276,8 @@ def targets(df, label_type, group_col="pID"):
         return df[["paper_soft_bac", "paper_soft_fung"]].to_numpy(dtype=np.float32)
     if label_type == "paper_hard":     # Travis: smear or culture positive, per pathogen
         return df[["hard_bac", "hard_fung"]].to_numpy(dtype=np.float32)
+    if label_type == "culture_hard":   # blood agar and PDA themselves; NaN where not done
+        return test_results(df, group_col)[:, [TESTS.index(c) for c in CULTURES]]
     if label_type == "twoclass_soft":  # P(bacterial | all four tests), complementary
         p = df["twoclass_bac"].to_numpy(dtype=np.float32)
         return np.stack([p, 1 - p], 1)

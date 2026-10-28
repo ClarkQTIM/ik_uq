@@ -69,30 +69,22 @@ As of 26 Oct: 2,883 of 3,813 images found; 930 trial enrolment photos (MUTT1 547
 exist only on the paper's Google Drive; asked Travis. When they arrive, put them under an image root
 and rerun this step; nothing else changes.
 
-## 3. Train on the paper's split
+## 3. What each analysis gets (seconds)
 
 ```bash
-python src/model.py --labels_csv results/labels/paper_labels.csv --label_type paper_soft --dry_run
-DRY_RUN=1 OUT_ROOT=results/paper_split scripts/launch_redo.sh     # the 10-run plan
-OUT_ROOT=results/paper_split scripts/launch_redo.sh               # go (cuda:0 + cuda:1)
+python src/analysis_sets.py --labels results/labels/paper_labels.csv --out results/analysis_sets
 ```
 
-| Setup | Head / labels | Scored |
-|---|---|---|
-| A_paper, C_paper | sigmoid / paper_soft, paper_hard | per pathogen vs Travis's hard labels (the paper's metric), and binary |
-| B_paper, D_paper | BD / paper_soft, paper_hard | same |
-| A_2c, C_2c | sigmoid / twoclass_soft, twoclass_hard | binary vs the two-class label |
-| B_2c, D_2c | BD / twoclass_soft, twoclass_hard | same |
-| SM, CU | sigmoid / smear, culture (BCE) | each output vs its own test |
+Two analyses (decided 28 Oct), both with two independent outputs and Travis's posteriors as soft labels:
 
-Paper recipe throughout; trains on the full paper training split. With the validation file in the label
-table, validation loss is logged each epoch (and the best-validation model saved for reference), but the
-recipe keeps the final epoch, as the paper did. Without it, `--val_share 0.15` would hold out 15% of
-training subjects instead.
-Test split divided 20/80 into calibration/evaluation for conformal. Each run's `test_metrics.json`
-has `per_pathogen_vs_hard_labels` (all test images, MADURAI, other studies).
-About 5 GPU-hours in all (about 2.5 on two GPUs). If CU runs out of memory (two stages train):
-`EXTRA="--batch 16 --accum 2" SETUPS="CU" OUT_ROOT=results/paper_split scripts/launch_redo.sh`.
+- **LCA analysis:** all images; hard = posterior > 0.5 (Travis's rule); scored against those hard labels.
+- **Culture analysis:** only images with at least one culture (MADURAI, SCUT); hard = the cultures (blood agar
+  for bacterial, PDA for fungal); scored against the cultures.
+
+For each, the report gives images and patients by split and study, hard-label combinations, where soft and
+hard labels differ, the evaluation set, cultures vs LCA labels, and what the missing photos take away. Each
+comes twice: **full** (everything in the paper's files) and **provisional** (images on our server now).
+Send back `results/analysis_sets/analysis_sets.md`.
 
 ## 4. Is there a genuine both / neither group? (about a minute)
 
@@ -103,6 +95,36 @@ python src/lca_states.py --labels results/labels/paper_labels.csv --out results/
 Fits the paper's two-class LCA, the same with a random effect (tests correlated within a class), and a
 two-pathogen model (bacterial only / fungal only / both / neither) to the four tests of the MADURAI subjects.
 Send back `results/lca_states/lca_states_report.md`.
+
+## 5. Train: provisional now, full when the photos arrive
+
+```bash
+python src/model.py --labels_csv results/labels/paper_labels.csv --label_type culture_hard --subset culture --dry_run
+DRY_RUN=1 OUT_ROOT=results/provisional scripts/launch_redo.sh      # the 10-run plan
+OUT_ROOT=results/provisional scripts/launch_redo.sh                # go (cuda:0 + cuda:1)
+```
+
+| Setup | Analysis | Head / soft or hard |
+|---|---|---|
+| A_cul, C_cul | culture (`--subset culture`) | sigmoid / paper_soft, culture_hard |
+| B_cul, D_cul | culture | BD / paper_soft, culture_hard |
+| A_lca, C_lca | LCA | sigmoid / paper_soft, paper_hard |
+| B_lca, D_lca | LCA | BD / paper_soft, paper_hard |
+| SM, CU | the paper's baselines | sigmoid / smear, culture (BCE, the supplement's recipes) |
+
+Soft and hard runs in each analysis share everything but the labels (paper recipe, rescaled MSE or the
+evidential loss). Every run's `test_metrics.json` scores each output against both references where it can:
+`per_pathogen_vs_hard_labels` and `per_pathogen_vs_culture` (all test images, MADURAI, other studies,
+evaluation set).
+
+**Provisional vs full.** The label table only uses images with a file, so a run today is the provisional
+version. The culture analysis is nearly final already (every MADURAI photo is here; SCUT is short). When
+Travis's photos arrive: put them under an image root, rerun step 2 (`paper_labels.py`), then
+`OUT_ROOT=results/full scripts/launch_redo.sh`. Nothing else changes.
+
+Paper recipe throughout; with the validation file, validation loss is logged each epoch but the final epoch
+is kept, as the paper did. About 5 GPU-hours for all ten (about 2.5 on two GPUs). If CU runs out of memory
+(two stages train): `EXTRA="--batch 16 --accum 2" SETUPS="CU" OUT_ROOT=... scripts/launch_redo.sh`.
 
 ## After the EDA (plan, to settle with the EDA in hand)
 
