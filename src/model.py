@@ -713,6 +713,30 @@ def predict(model, paths, transform, batch, device, num_workers):
     return out.numpy(), model.p_hat(out).numpy()
 
 
+def per_pathogen_uq(p, out, head, ref):
+    """For each output against a per-pathogen reference (NaN = no label): AUROC, accuracy at 0.5, and how well
+    uncertainty flags the errors (AUROC of entropy, and of low BD evidence = -(alpha + beta), for wrong vs right).
+    Used on the validation set to choose BD's KL setting."""
+    res = {}
+    for j, name in enumerate(("bacterial", "fungal")):
+        m = ~np.isnan(ref[:, j])
+        t, pj = ref[m, j], np.clip(p[m, j], 1e-7, 1 - 1e-7)
+        r = {"n_images": int(m.sum())}
+        if m.any():
+            err = (pj > 0.5) != (t == 1)
+            ent = -(pj * np.log(pj) + (1 - pj) * np.log(1 - pj))
+            r["accuracy"] = float(1 - err.mean())
+            r["auroc"] = float(roc_auc_score(t, pj)) if len(np.unique(t)) == 2 else None
+            two = len(np.unique(err)) == 2
+            r["error_detection_entropy"] = float(roc_auc_score(err, ent)) if two else None
+            if head == "beta_dirichlet":
+                ev = out[m, 2 * j] + out[m, 2 * j + 1]
+                r["mean_evidence"] = float(ev.mean())
+                r["error_detection_evidence"] = float(roc_auc_score(err, -ev)) if two else None
+        res[name] = r
+    return res
+
+
 def binary_metrics(y, score, p):
     """AUROC of the bacterial-vs-fungal score and of each pathogen output, accuracy at 0.5."""
     if len(y) == 0:
@@ -880,6 +904,28 @@ def main(argv=None):
     else:
         p2 = loader(tr, train_tf, args.batch_phase2 or args.batch, True)
         model = train_legacy(model, (train_loader, p2, val_loader), args, device, out_dir)
+
+    # --- Validation predictions (no identifiers): to choose BD's KL setting -------------------
+    if len(va) and args.labels_csv:
+        vout, vp = predict(model, paths[va], eval_tf, args.batch, device, nw)
+        vsub = df.iloc[va]
+        vref = {"lca_hard_labels": vsub[["hard_bac", "hard_fung"]].to_numpy(dtype=float),
+                "culture": test_results(df, args.group_col)[va][:, [TESTS.index(c) for c in CULTURES]].astype(float)}
+        vmad = np.array([STUDY_SHORT.get(x, x) for x in vsub["study"]]) == "MADURAI"
+        vmetrics = {"n_images": int(len(va)), "n_patients": int(vsub[args.group_col].nunique()),
+                    "head": args.head, "label_type": args.label_type, "subset": args.subset,
+                    "kl_schedule": args.kl_schedule, "kl_max": args.kl_max, "kl_form": args.kl_form}
+        for rname, ref in vref.items():
+            vmetrics[rname] = {"all": per_pathogen_uq(vp, vout, args.head, ref),
+                               "MADURAI": per_pathogen_uq(vp[vmad], vout[vmad], args.head, ref[vmad])}
+        with open(os.path.join(out_dir, "val_metrics.json"), "w") as f:
+            json.dump(vmetrics, f, indent=2)
+        np.savez(os.path.join(out_dir, "val_predictions.npz"), output=vout, p_hat=vp,
+                 lca_hard_labels=vref["lca_hard_labels"], culture=vref["culture"],
+                 study=np.array([STUDY_SHORT.get(x, x) for x in vsub["study"]]),
+                 participant=participant_codes(df, args.group_col)[va], head=args.head)
+        print("  validation: " + "; ".join(
+            f"{r} {k} AUROC {vmetrics[r]['all'][k].get('auroc')}" for r in vref for k in ("bacterial", "fungal")))
 
     # --- Test predictions (no identifiers) ---------------------------------------
     out, p = predict(model, paths[test], eval_tf, args.batch, device, nw)

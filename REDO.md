@@ -96,7 +96,23 @@ Fits the paper's two-class LCA, the same with a random effect (tests correlated 
 two-pathogen model (bacterial only / fungal only / both / neither) to the four tests of the MADURAI subjects.
 Send back `results/lca_states/lca_states_report.md`.
 
-## 5. Train: provisional now, full when the photos arrive
+## 5. Choose BD's KL setting on validation (first)
+
+```bash
+DRY_RUN=1 OUT_ROOT=results/provisional_kl scripts/launch_kl_redo.sh     # the 20-run plan
+EXTRA="--backbone tf_efficientnet_b7.aa_in1k" OUT_ROOT=results/provisional_kl scripts/launch_kl_redo.sh
+python src/select_kl.py --runs results/provisional_kl                     # when they finish
+```
+
+Five KL settings (published; Sensoy form 0.01, 0.1, 1; ICMLA form 1) x BD soft and hard x both analyses. Each run
+scores its validation images: discrimination (AUROC against the analysis's reference) and how well low evidence
+flags the errors (entropy alongside). `select_kl.py` reports both with patient-level bootstrap intervals and
+picks the best discrimination, the best evidence, and the proposed rule (best evidence within 0.02 AUROC of the
+best). Never the validation loss: it contains the KL term. Send back
+`results/provisional_kl/kl_selection/kl_selection.md`. The chosen BD runs are the main BD runs; step 6 then only
+needs the sigmoid runs and baselines (`SETUPS="A_cul C_cul A_lca C_lca SM CU"`).
+
+## 6. Train: provisional now, full when the photos arrive
 
 ```bash
 python src/model.py --labels_csv results/labels/paper_labels.csv --label_type culture_hard --subset culture --dry_run
