@@ -102,9 +102,13 @@ def main():
     if a.val_csv:
         parts.append(load_paper(a.val_csv, "val", notes)[0])
     d = pd.concat(parts, ignore_index=True)
-    dup = int(d.duplicated("Drive_image_path").sum())
-    if dup:
-        notes.append(f"{dup} image paths appear more than once across the files")
+    dup = d.duplicated("Drive_image_path")
+    if dup.any():
+        same_split = int(d[dup].merge(d[~dup], on="Drive_image_path", suffixes=("", "_first"))
+                         .eval("split == split_first").sum())
+        notes.append(f"{int(dup.sum())} image paths appear more than once across the files "
+                     f"({same_split} within the same split); the repeats are dropped")
+        d = d[~dup].reset_index(drop=True)
     leak = d.groupby("subject")["split"].nunique()
     if (leak > 1).any():
         notes.append(f"{int((leak > 1).sum())} subjects appear in more than one split")

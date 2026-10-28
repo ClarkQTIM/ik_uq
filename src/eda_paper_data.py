@@ -521,6 +521,20 @@ def main():
         out_rows = old[~old_m.to_numpy()]
         out_fu = out_rows.visit.isin(FOLLOWUP_VISITS)
         left_out = (len(out_rows), int(out_fu.sum()), out_rows[~out_fu].study_s.value_counts())
+        # are the ones that aren't follow-ups the photos without test results or labels?
+        oth = out_rows[~out_fu].copy()
+        rec = pd.DataFrame({t: pd.to_numeric(oth[t], errors='coerce').isin([0, 1]) for t in TESTS if t in oth}, index=oth.index)
+        oth['_any_test'] = rec.any(axis=1) if len(rec.columns) else False
+        oth['_all_tests'] = rec.all(axis=1) if len(rec.columns) == 4 else False
+        pb = pd.to_numeric(oth.get('bac_post_prob', pd.Series(np.nan, index=oth.index)), errors='coerce')
+        oth['_posterior'] = pb.between(0, 1)
+        bb = pd.to_numeric(oth.get('bac_LCA_bin', pd.Series(np.nan, index=oth.index)), errors='coerce')
+        oth['_bin'] = bb.isin([0, 1])
+        out_tests = (oth.groupby('study_s').agg(photos=('basename', 'size'), with_any_test=('_any_test', 'sum'),
+                                                with_all_four_tests=('_all_tests', 'sum'), with_a_posterior=('_posterior', 'sum'),
+                                                with_an_LCA_bin=('_bin', 'sum')).reset_index()
+                     .rename(columns={'study_s': 'study'}).sort_values('photos', ascending=False))
+        left_out = left_out + (int((~oth['_any_test']).sum()), int((~oth['_bin']).sum()))
         # subject vs pID, split by pID
         sub_lines = []
         if "pID" in o and matched.any():
@@ -550,7 +564,9 @@ def main():
                 "Images with any test recorded, by study (matched):\n\n" + md(save(filled_by_study, "old_vs_paper_tests_by_study.csv"), ".0f"),
                 "Posteriors, paper vs ours:\n\n" + md(save(pd.DataFrame(prow), "old_vs_paper_posteriors.csv")),
                 "Travis's hard labels vs our LCA bins:\n\n" + md(pd.DataFrame(brow)),
-                "Our images in and out of the paper set, by study and visit:\n\n" + md(save(left, "old_in_paper_set.csv"), ".0f"))
+                "Our images in and out of the paper set, by study and visit:\n\n" + md(save(left, "old_in_paper_set.csv"), ".0f"),
+                "Our photos in none of the paper's files and not follow-ups: do they have tests and labels?\n\n"
+                + md(save(out_tests, "old_not_in_paper_tests.csv"), ".0f"))
         answers_old = (matched, filled_by_study, left_out)
         d["_our_path"] = np.where(matched, o["file_path"].astype(str).str.replace(PACS_PREFIX, a.img_root, regex=False), "")
     else:
@@ -614,10 +630,11 @@ def main():
     answers.append("**Travis's hard labels** [bacterial, fungal]: " + ", ".join(f"[{k}] {vc.get(k, 0):,}" for k in ("1,0", "0,1", "1,1", "0,0"))
                    + f"; [0,0] with no test recorded at all: {int((d.no_tests & (d.hard_combo == '0,0')).sum()):,}.")
     if answers_old is not None:
-        matched, _, (n_out, n_out_fu, out_other) = answers_old
+        matched, _, (n_out, n_out_fu, out_other, out_no_test, out_no_bin) = answers_old
         answers.append(f"**Against our CSV.** {int(matched.sum()):,} of {len(d):,} paper images matched to our rows.")
         answers.append(f"**Our photos in none of the paper's files.** {n_out:,} of our CSV rows: {n_out_fu:,} follow-ups and "
-                       f"{int(out_other.sum()):,} others (" + ", ".join(f"{k} {v:,}" for k, v in out_other.items()) + ").")
+                       f"{int(out_other.sum()):,} others (" + ", ".join(f"{k} {v:,}" for k, v in out_other.items()) + "). "
+                       f"Of those others, {out_no_test:,} have no test result and {out_no_bin:,} no LCA bin in our CSV.")
     answers.append(files_answer)
 
     with open(os.path.join(a.out, "eda_report.md"), "w") as f:
