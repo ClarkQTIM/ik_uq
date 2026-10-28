@@ -27,6 +27,7 @@ Load-time checks fail loudly instead of passing bad values through.
 
 import os
 import re
+import zlib
 
 import numpy as np
 import pandas as pd
@@ -229,12 +230,17 @@ def load_paper_table(path, verbose=True, require_image=True):
     return t.reset_index(drop=True)
 
 
+def calibration_patient(group, seed=42, share=20):
+    """True for about `share`% of patients, fixed by a hash of the patient ID and the seed."""
+    return zlib.crc32(f"{seed}:{group}".encode()) % 100 < share
+
+
 def split_paper(df, seed=42, group_col="subject", val_share=0.0):
     """
     The paper's own split (column 'split'): train / test, plus 'val' rows if the table has them.
     Without them, val_share > 0 carves that share of training subjects off as validation; 0 (default)
     leaves no validation set: the paper recipe never uses one to choose the model.
-    The test set is split 20/80 into calibration / evaluation, grouped by subject.
+    The test set is split about 20/80 into calibration / evaluation by a fixed hash of each subject.
     """
     split = df["split"].astype(str).to_numpy()
     groups = df[group_col].to_numpy()
@@ -245,11 +251,11 @@ def split_paper(df, seed=42, group_col="subject", val_share=0.0):
         tr_rel, va_rel = next(GroupShuffleSplit(1, test_size=val_share, random_state=seed)
                               .split(tr, groups=groups[tr]))
         tr, va = tr[tr_rel], tr[va_rel]
-    if len(te):
-        ca_rel, ev_rel = next(GroupShuffleSplit(1, test_size=0.80, random_state=seed).split(te, groups=groups[te]))
-    else:
-        ca_rel = ev_rel = np.array([], dtype=int)
-    parts = {"train": tr, "val": va, "test": te, "cal": te[ca_rel], "eval": te[ev_rel]}
+    # Calibration (about 20%) vs evaluation by a fixed hash of each patient, not a random draw over whoever is in
+    # the test set: a patient lands on the same side in the provisional and full runs and in both analyses, so the
+    # MADURAI evaluation patients are identical everywhere.
+    is_cal = np.array([calibration_patient(g, seed) for g in groups[te]], dtype=bool)
+    parts = {"train": tr, "val": va, "test": te, "cal": te[is_cal], "eval": te[~is_cal]}
     for a, b in [("train", "val"), ("train", "test"), ("val", "test"), ("cal", "eval")]:
         shared = set(groups[parts[a]]) & set(groups[parts[b]])
         if shared:
