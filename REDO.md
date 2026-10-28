@@ -94,6 +94,16 @@ has `per_pathogen_vs_hard_labels` (all test images, MADURAI, other studies).
 About 5 GPU-hours in all (about 2.5 on two GPUs). If CU runs out of memory (two stages train):
 `EXTRA="--batch 16 --accum 2" SETUPS="CU" OUT_ROOT=results/paper_split scripts/launch_redo.sh`.
 
+## 4. Is there a genuine both / neither group? (about a minute)
+
+```bash
+python src/lca_states.py --labels results/labels/paper_labels.csv --out results/lca_states
+```
+
+Fits the paper's two-class LCA, the same with a random effect (tests correlated within a class), and a
+two-pathogen model (bacterial only / fungal only / both / neither) to the four tests of the MADURAI subjects.
+Send back `results/lca_states/lca_states_report.md`.
+
 ## After the EDA (plan, to settle with the EDA in hand)
 
 1. Labels from the paper's files: soft = the paper's posteriors; hard = Travis's rule; the paper's
